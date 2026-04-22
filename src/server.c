@@ -117,6 +117,7 @@ static void process_packets(struct rte_mbuf **pkts, uint16_t nb_pkts)
         udp_hdr->dst_port = tmp_port;
 
         // Atualiza checksums
+        // Recalcular o Checksum, ele sendo 0 pode dar erro!
         ip_hdr->hdr_checksum = 0;
         udp_hdr->dgram_cksum = 0;
 
