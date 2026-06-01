@@ -94,7 +94,7 @@ install_trex() {
     cd "${TREX_DIR}"
 
     log "Download de: ${TREX_DOWNLOAD_URL}"
-    wget --progress=bar:force -O "v${TREX_VERSION}.tar.gz" "${TREX_DOWNLOAD_URL}" || \
+    wget --progress=bar:force --no-check-certificate -O "v${TREX_VERSION}.tar.gz" "${TREX_DOWNLOAD_URL}" || \
         die "Falha no download. Verifique a versão em: https://trex-tgn.cisco.com/trex/release/"
 
     log "Extraindo..."
