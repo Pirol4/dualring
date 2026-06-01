@@ -78,6 +78,14 @@ check_prerequisites() {
         modprobe uio_pci_generic || true
     fi
     log "Módulos de kernel OK."
+
+    # rdma-core / libibverbs — necessário para PMD mlx5 do T-Rex sem OFED completo
+    if ! dpkg -l rdma-core &>/dev/null; then
+        log "Instalando rdma-core (libibverbs para mlx5 PMD)..."
+        apt-get install -y --quiet rdma-core libibverbs-dev libmlx5-dev ibverbs-utils 2>/dev/null || \
+            warn "Pacotes rdma-core não instalados — mlx5 PMD pode falhar."
+    fi
+    log "rdma-core OK."
 }
 
 # ─── 2. Download e extração do T-Rex ─────────────────────────────────────────
@@ -102,6 +110,49 @@ install_trex() {
     rm -f "v${TREX_VERSION}.tar.gz"
 
     log "T-Rex instalado em ${TREX_DIR}/v${TREX_VERSION}"
+}
+
+# ─── 2b. Compatibilidade Python 3.8+ ─────────────────────────────────────────
+# platform.dist() e platform.linux_distribution() foram removidos no Python 3.8.
+# Ubuntu 20.04 usa Python 3.8.x, então precisamos corrigir os scripts do T-Rex.
+
+fix_python38_compat() {
+    sep "Corrigindo compatibilidade Python 3.8+"
+
+    local trex_install="${TREX_DIR}/v${TREX_VERSION}"
+
+    # Encontra todos os .py que chamam platform.dist ou platform.linux_distribution
+    local broken_files
+    broken_files=$(grep -rl "platform\.dist\(\|platform\.linux_distribution(" \
+        "${trex_install}" --include="*.py" 2>/dev/null || true)
+
+    if [[ -z "${broken_files}" ]]; then
+        log "Nenhum arquivo com platform.dist encontrado — OK."
+    else
+        log "Arquivos para patching:"
+        while IFS= read -r f; do
+            echo "  ${f}"
+            # Injeta shim no topo do arquivo (após a primeira linha shebang/comentário, se existir)
+            if ! grep -q "platform\.dist = lambda" "${f}"; then
+                sed -i '1s/^/import platform\nif not hasattr(platform, "dist"):\n    platform.dist = lambda *a, **k: ("", "", "")\n    platform.linux_distribution = lambda *a, **k: ("", "", "")\n/' "${f}"
+            fi
+        done <<< "${broken_files}"
+        log "Shim de compatibilidade injetado."
+    fi
+
+    # Garante que ofed_info existe (T-Rex verifica presença; sem OFED completo, cria stub)
+    if ! command -v ofed_info &>/dev/null; then
+        log "Criando stub /usr/bin/ofed_info para passar verificação do T-Rex..."
+        cat > /usr/bin/ofed_info << 'STUB'
+#!/bin/bash
+# Stub: MLNX OFED não instalado; T-Rex usa rdma-core (in-kernel mlx5).
+echo "MLNX_OFED_LINUX-5.4-0 (User space)"
+STUB
+        chmod +x /usr/bin/ofed_info
+        log "Stub /usr/bin/ofed_info criado."
+    else
+        log "ofed_info já presente — OK."
+    fi
 }
 
 # ─── 3. Detecção automática de NICs ConnectX-5 ────────────────────────────────
@@ -539,6 +590,7 @@ main() {
 
     check_prerequisites
     install_trex
+    fix_python38_compat
     detect_nics
     bind_nics
     generate_trex_config
