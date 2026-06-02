@@ -52,7 +52,6 @@ PROFILES_DIR="${TREX_DIR}/profiles"
 check_prerequisites() {
     sep "Verificando pré-requisitos"
 
-    # Hugepages de 1 GiB (obrigatório para o T-Rex)
     local hp_total
     hp_total=$(grep -i 'HugePages_Total' /proc/meminfo | awk '{print $2}')
     if [[ "${hp_total}" -lt 2 ]]; then
@@ -60,18 +59,15 @@ check_prerequisites() {
     fi
     log "Hugepages OK: ${hp_total} × 1 GiB disponíveis."
 
-    # Python 3 (necessário para scripts de controle do T-Rex)
     python3 --version &>/dev/null || die "Python 3 não encontrado. Execute setup_dpdk.sh primeiro."
     log "Python 3 OK: $(python3 --version)"
 
-    # scapy (necessário para os perfis de tráfego)
     if ! python3 -c "import scapy" &>/dev/null; then
         log "Instalando scapy..."
         pip3 install scapy --quiet
     fi
     log "scapy OK."
 
-    # vfio-pci (necessário para bind das NICs)
     if ! lsmod | grep -q vfio_pci; then
         log "Carregando módulo vfio-pci..."
         modprobe vfio-pci || warn "vfio-pci não disponível — T-Rex usará uio_pci_generic como fallback."
@@ -79,7 +75,6 @@ check_prerequisites() {
     fi
     log "Módulos de kernel OK."
 
-    # rdma-core / libibverbs — necessário para PMD mlx5 do T-Rex sem OFED completo
     if ! dpkg -l rdma-core &>/dev/null; then
         log "Instalando rdma-core (libibverbs para mlx5 PMD)..."
         apt-get install -y --quiet rdma-core libibverbs-dev libmlx5-dev ibverbs-utils 2>/dev/null || \
@@ -113,15 +108,12 @@ install_trex() {
 }
 
 # ─── 2b. Compatibilidade Python 3.8+ ─────────────────────────────────────────
-# platform.dist() e platform.linux_distribution() foram removidos no Python 3.8.
-# Ubuntu 20.04 usa Python 3.8.x, então precisamos corrigir os scripts do T-Rex.
 
 fix_python38_compat() {
     sep "Corrigindo compatibilidade Python 3.8+"
 
     local trex_install="${TREX_DIR}/v${TREX_VERSION}"
 
-    # Encontra todos os .py que chamam platform.dist ou platform.linux_distribution
     local broken_files
     broken_files=$(grep -rl "platform\.dist\(\|platform\.linux_distribution(" \
         "${trex_install}" --include="*.py" 2>/dev/null || true)
@@ -132,7 +124,6 @@ fix_python38_compat() {
         log "Arquivos para patching:"
         while IFS= read -r f; do
             echo "  ${f}"
-            # Injeta shim no topo do arquivo (após a primeira linha shebang/comentário, se existir)
             if ! grep -q "platform\.dist = lambda" "${f}"; then
                 sed -i '1s/^/import platform\nif not hasattr(platform, "dist"):\n    platform.dist = lambda *a, **k: ("", "", "")\n    platform.linux_distribution = lambda *a, **k: ("", "", "")\n/' "${f}"
             fi
@@ -140,12 +131,10 @@ fix_python38_compat() {
         log "Shim de compatibilidade injetado."
     fi
 
-    # Garante que ofed_info existe (T-Rex verifica presença; sem OFED completo, cria stub)
     if ! command -v ofed_info &>/dev/null; then
         log "Criando stub /usr/bin/ofed_info para passar verificação do T-Rex..."
         cat > /usr/bin/ofed_info << 'STUB'
 #!/bin/bash
-# Stub: MLNX OFED não instalado; T-Rex usa rdma-core (in-kernel mlx5).
 echo "MLNX_OFED_LINUX-5.4-0 (User space)"
 STUB
         chmod +x /usr/bin/ofed_info
@@ -160,7 +149,6 @@ STUB
 detect_nics() {
     sep "Detectando NICs ConnectX-5"
 
-    # Procura dispositivos Mellanox/NVIDIA ConnectX na lista PCI
     local nics
     nics=$(lspci -D | grep -iE 'Mellanox|ConnectX' | grep -v 'Virtual' | awk '{print $1}' || true)
 
@@ -196,10 +184,6 @@ detect_nics() {
 bind_nics() {
     sep "Configurando NICs para uso com T-Rex"
 
-    # ConnectX-5 suporta modo bifurcado (NIC permanece no driver mlx5_core do kernel
-    # E o DPDK acessa via PMD mlx5). T-Rex detecta isso automaticamente — não precisa bind.
-    # Se mlx5_core não estiver disponível, faz bind para vfio-pci.
-
     for port in "${PORT0}" "${PORT1}"; do
         local current_driver
         current_driver=$(lspci -D -k -s "${port}" 2>/dev/null | grep 'Kernel driver in use' | awk '{print $NF}' || echo "none")
@@ -229,18 +213,15 @@ bind_nics() {
 generate_trex_config() {
     sep "Gerando /etc/trex_cfg.yaml"
 
-    # Detecta número de threads disponíveis (deixa core 0 para o master e core 1 para latência)
     local total_cores
     total_cores=$(nproc --all)
     local worker_start=2
     local worker_end=$((total_cores - 1))
 
-    # Detecta NUMA node das NICs para afinidade de memória
     local numa0
     numa0=$(cat "/sys/bus/pci/devices/${PORT0}/numa_node" 2>/dev/null || echo 0)
-    [[ "${numa0}" -lt 0 ]] && numa0=0  # -1 significa sem NUMA info, usa 0
+    [[ "${numa0}" -lt 0 ]] && numa0=0
 
-    # Gera lista de threads workers: "2,3,4,...,N"
     local threads=""
     for ((i=worker_start; i<=worker_end; i++)); do
         threads+="${i}"
@@ -250,14 +231,11 @@ generate_trex_config() {
     cat > /etc/trex_cfg.yaml << EOF
 # Configuração T-Rex gerada por setup_trex.sh
 # Gerado em: $(date)
-# Servidores: servidor 2 (gerador de carga) ↔ servidor 1 (DUT)
-# Hardware: ConnectX-5 100 GbE back-to-back
 
 - port_limit      : 2
   version         : 2
   interfaces      : ['${PORT0}', '${PORT1}']
 
-  # IPs de referência para fluxos L3 (podem ser ajustados nos perfis de tráfego)
   port_info       :
     - ip          : 16.0.0.1
       default_gw  : 48.0.0.1
@@ -265,8 +243,8 @@ generate_trex_config() {
       default_gw  : 16.0.0.1
 
   platform        :
-    master_thread_id  : 0        # Core 0: processo master do T-Rex
-    latency_thread_id : 1        # Core 1: medição de latência (precisão ~1 µs)
+    master_thread_id  : 0
+    latency_thread_id : 1
     dual_if           :
       - socket    : ${numa0}
         threads   : [${threads}]
@@ -285,14 +263,10 @@ create_traffic_profiles() {
 
     mkdir -p "${PROFILES_DIR}"
 
-    # ── Perfil 1: Fluxo contínuo — pacotes de 64 bytes ──────────────────────────
     cat > "${PROFILES_DIR}/steady_64b.py" << 'EOF'
 """
 Perfil: fluxo contínuo de pacotes de 64 bytes
-Uso: ./t-rex-64 -f profiles/steady_64b.py -m 100% --port 0 1
-
-Parâmetros ajustáveis via -t:
-  rate_pps : taxa em pacotes/s (padrão: None = usa -m do CLI)
+Uso: ./t-rex-64 -f profiles/steady_64b.py -m 100% --port 0 1 -d 60
 """
 from trex_stl_lib.api import *
 
@@ -300,18 +274,15 @@ class STLSteady64(object):
 
     def get_streams(self, tunables, **kwargs):
         parser = STLArgParser()
-        parser.add_argument('--rate-pps', type=float, default=None,
-                            help='Taxa explícita em pps (default: controlada pelo -m do CLI)')
+        parser.add_argument('--rate-pps', type=float, default=None)
         args = parser.parse_args(tunables)
 
-        # Pacote Ethernet/IP/UDP de exatamente 64 bytes (sem FCS)
         base_pkt = (Ether(src='10:00:00:00:00:01', dst='ff:ff:ff:ff:ff:ff') /
                     IP(src='16.0.0.1', dst='48.0.0.1', ttl=64) /
                     UDP(sport=1025, dport=12))
-        pad_len = max(0, 64 - len(base_pkt) - 4)  # -4 = FCS adicionado pelo hardware
+        pad_len = max(0, 64 - len(base_pkt) - 4)
         pkt = base_pkt / Raw(b'\x00' * pad_len)
 
-        # Stream de dados
         if args.rate_pps:
             mode = STLTXCont(pps=args.rate_pps)
         else:
@@ -324,11 +295,10 @@ class STLSteady64(object):
             flow_stats=STLFlowStats(pg_id=1),
         )
 
-        # Stream de latência (1 em cada 1000 pacotes; timestamps de hardware)
         lat_stream = STLStream(
             name='latency',
             packet=STLPktBuilder(pkt=pkt),
-            mode=STLTXCont(pps=1000),       # taxa baixa: não interfere na medição
+            mode=STLTXCont(pps=1000),
             flow_stats=STLFlowLatencyStats(pg_id=11),
         )
 
@@ -339,11 +309,10 @@ def register():
     return STLSteady64()
 EOF
 
-    # ── Perfil 2: Fluxo contínuo — pacotes de 1500 bytes ────────────────────────
     cat > "${PROFILES_DIR}/steady_1500b.py" << 'EOF'
 """
-Perfil: fluxo contínuo de pacotes de 1500 bytes (MTU Ethernet padrão)
-Uso: ./t-rex-64 -f profiles/steady_1500b.py -m 100% --port 0 1
+Perfil: fluxo contínuo de pacotes de 1500 bytes
+Uso: ./t-rex-64 -f profiles/steady_1500b.py -m 100% --port 0 1 -d 60
 """
 from trex_stl_lib.api import *
 
@@ -377,11 +346,7 @@ def register():
     return STLSteady1500()
 EOF
 
-    # ── Perfil 3: Tráfego bursty — 64 bytes ─────────────────────────────────────
-    # Este perfil é o mais importante: revela o trade-off anel grande vs. pequeno.
-    # burst_pkts  : número de pacotes por burst (default: 2048 ≈ 2× o anel padrão de 1024)
-    # burst_pps   : taxa durante o burst (default: line-rate ~148 Mpps para 64B em 100GbE)
-    # idle_us     : pausa entre bursts em microsegundos (default: 10 µs)
+    # FIX: isg espera microsegundos — usa args.idle_us diretamente (não * 1000)
     cat > "${PROFILES_DIR}/bursty_64b.py" << 'EOF'
 """
 Perfil: tráfego bursty de 64 bytes — revela o trade-off leaky DMA.
@@ -391,12 +356,12 @@ Estrutura de cada ciclo:
 
 Parâmetros ajustáveis via -t:
   --burst-pkts N   Pacotes por burst       (padrão: 2048)
-  --burst-pps  N   Taxa durante o burst    (padrão: 100_000_000  = 100 Mpps)
+  --burst-pps  N   Taxa durante o burst    (padrão: 100_000_000 = 100 Mpps)
   --idle-us    N   Pausa entre bursts (µs) (padrão: 10)
 
 Uso:
-  ./t-rex-64 -f profiles/bursty_64b.py --port 0 1
-  ./t-rex-64 -f profiles/bursty_64b.py -t --burst-pkts 4096 --idle-us 50 --port 0 1
+  ./t-rex-64 -f profiles/bursty_64b.py --port 0 1 -d 60
+  ./t-rex-64 -f profiles/bursty_64b.py -t --burst-pkts 4096 --idle-us 50 --port 0 1 -d 60
 """
 from trex_stl_lib.api import *
 
@@ -415,10 +380,7 @@ class STLBursty64(object):
         pad_len = max(0, 64 - len(base_pkt) - 4)
         pkt = base_pkt / Raw(b'\x00' * pad_len)
 
-        # IBG = inter-burst gap em microsegundos → converte para nanossegundos
-        ibg_ns = args.idle_us * 1000
-
-        # Stream burst principal: envia burst_pkts a burst_pps, depois pausa ibg_ns
+        # isg no T-Rex STL é em MICROSEGUNDOS — passa idle_us diretamente
         burst_stream = STLStream(
             name='burst',
             packet=STLPktBuilder(pkt=pkt),
@@ -427,12 +389,10 @@ class STLBursty64(object):
                 total_pkts=args.burst_pkts,
             ),
             flow_stats=STLFlowStats(pg_id=3),
-            # Após o burst, espera ibg_ns antes do próximo ciclo
-            isg=ibg_ns,
-            next='burst',           # loop: repete indefinidamente
+            isg=args.idle_us,   # gap em µs antes de cada ativação do burst
+            next='burst',       # loop: re-activa o stream após cada burst
         )
 
-        # Stream de latência independente (taxa baixa, não interfere no burst)
         lat_stream = STLStream(
             name='latency',
             packet=STLPktBuilder(pkt=pkt),
@@ -450,40 +410,36 @@ EOF
     log "Perfis criados em ${PROFILES_DIR}:"
     log "  steady_64b.py   — fluxo contínuo, 64B"
     log "  steady_1500b.py — fluxo contínuo, 1500B"
-    log "  bursty_64b.py   — tráfego bursty, 64B (revela trade-off do anel)"
+    log "  bursty_64b.py   — tráfego bursty, 64B"
 }
 
-# ─── 7. Script auxiliar de execução ──────────────────────────────────────────
+# ─── 7. Scripts auxiliares ────────────────────────────────────────────────────
 
 create_run_helper() {
     sep "Criando scripts auxiliares"
 
-    local trex_bin="${TREX_DIR}/v${TREX_VERSION}/t-rex-64"
+    local trex_bin="${TREX_DIR}/v${TREX_VERSION}"
 
-    # ── run_trex.sh: wrapper geral para iniciar o T-Rex ──────────────────────
+    # FIX: run_trex usa modo batch (sem -i) — -i é modo servidor, incompatível com -f/-m/-d
     cat > /usr/local/bin/run_trex << EOF
 #!/bin/bash
-# Wrapper para iniciar o T-Rex em modo stateless interativo.
-# Uso: run_trex [args adicionais para t-rex-64]
-# Exemplo: run_trex -f ~/trex/profiles/steady_64b.py -m 50% --port 0 1 -d 30
+# Wrapper para o T-Rex em modo batch (stateless).
+# Uso: run_trex -f <perfil> -m <taxa> -d <duração_s> --port 0 1
+# Exemplo: run_trex -f ~/trex/profiles/steady_64b.py -m 50% -d 30 --port 0 1
 
-TREX_DIR="${TREX_DIR}/v${TREX_VERSION}"
-cd "\${TREX_DIR}"
-sudo ./t-rex-64 -i --cfg /etc/trex_cfg.yaml "\$@"
+TREX_BIN="${TREX_DIR}/v${TREX_VERSION}"
+cd "\${TREX_BIN}"
+sudo ./t-rex-64 --cfg /etc/trex_cfg.yaml "\$@"
 EOF
     chmod +x /usr/local/bin/run_trex
 
-    # ── collect_baseline.sh: coleta as 10 repetições de um experimento ───────
+    # FIX: collect_baseline captura stdout em vez de usar --output-file (flag inexistente)
     cat > /usr/local/bin/collect_baseline << 'SCRIPT'
 #!/bin/bash
 # Executa N repetições de um perfil T-Rex e salva os resultados.
 #
 # Uso: collect_baseline <perfil> <duracao_s> <taxa> [repeticoes]
-#
-# Exemplo:
-#   collect_baseline ~/trex/profiles/steady_64b.py 60 100% 10
-#
-# Saída: results/<perfil>_<timestamp>/run_N.json
+# Exemplo: collect_baseline ~/trex/profiles/steady_64b.py 60 100% 10
 
 set -euo pipefail
 
@@ -511,22 +467,21 @@ for ((i=1; i<=REPS; i++)); do
     echo -n "[$(date +%H:%M:%S)] Run ${i}/${REPS}... "
 
     cd "${TREX_DIR}"
-    # Executa o T-Rex em modo batch (não interativo) com saída JSON
+    # Redireciona stdout para arquivo — T-Rex não tem flag --output-file
     sudo ./t-rex-64 \
         --cfg /etc/trex_cfg.yaml \
         -f "${PROFILE}" \
         -m "${RATE}" \
         -d "${DURATION}" \
         --port 0 1 \
-        --output-file "${OUTDIR}/run_${i}.json" \
         --no-watchdog \
+        > "${OUTDIR}/run_${i}.txt" \
         2>"${OUTDIR}/run_${i}.stderr" || {
             echo "ERRO (ver ${OUTDIR}/run_${i}.stderr)"
             continue
         }
 
-    echo "OK → ${OUTDIR}/run_${i}.json"
-    # Espera 5s entre runs para o DUT estabilizar
+    echo "OK → ${OUTDIR}/run_${i}.txt"
     [[ $i -lt $REPS ]] && sleep 5
 done
 
@@ -536,8 +491,8 @@ SCRIPT
     chmod +x /usr/local/bin/collect_baseline
 
     log "Scripts auxiliares criados:"
-    log "  run_trex          — inicia o T-Rex (modo interativo)"
-    log "  collect_baseline  — executa N repetições e salva JSONs"
+    log "  run_trex          — inicia o T-Rex (modo batch)"
+    log "  collect_baseline  — executa N repetições e salva resultados"
 }
 
 # ─── 8. Resumo final ─────────────────────────────────────────────────────────
@@ -561,25 +516,23 @@ print_summary() {
     echo "│  1. Verificar configuração:                                     │"
     echo "│     cat /etc/trex_cfg.yaml                                      │"
     echo "│                                                                 │"
-    echo "│  2. Testar link (modo servidor — mantém o processo rodando):    │"
-    echo "│     run_trex --learn-mode                                       │"
-    echo "│                                                                 │"
-    echo "│  3. Enviar tráfego de teste (30s, 10% da linha):               │"
+    echo "│  2. Teste inicial (30s, 10% da linha):                         │"
     echo "│     run_trex -f ~/trex/profiles/steady_64b.py -m 10% -d 30     │"
     echo "│     --port 0 1                                                  │"
     echo "│                                                                 │"
-    echo "│  4. Coletar baseline completo (10 repetições, 60s cada):       │"
+    echo "│  3. Coletar baseline completo (10 repetições, 60s cada):       │"
     echo "│     collect_baseline ~/trex/profiles/steady_64b.py 60 100% 10  │"
     echo "│                                                                 │"
-    echo "│  MÉTRICAS disponíveis nos JSONs de saída:                      │"
+    echo "│  MÉTRICAS disponíveis na saída texto:                          │"
     echo "│    - throughput (Mpps, Gbps)                                    │"
     echo "│    - packet loss rate                                           │"
-    echo "│    - latência: avg, min, max, percentis (µs)                   │"
+    echo "│    - latência: avg, min, max, jitter (µs)                      │"
     echo "└─────────────────────────────────────────────────────────────────┘"
     echo
     warn "Lembre-se: o DUT (servidor 1) deve estar rodando antes de enviar tráfego."
-    warn "Comando no servidor 1: sudo ~/dpdk/build/examples/dpdk-l2fwd -l 0-15 -n 4 \\"
-    warn "    -a 0000:41:00.0 -a 0000:41:00.1 -- -p 0x3 -T 1"
+    warn "Comando no servidor 1:"
+    warn "  sudo ~/dpdk/build/examples/dpdk-l2fwd -l 0-15 -n 4 \\"
+    warn "      -a 0000:41:00.0 -a 0000:41:00.1 -- -p 0x3 -T 1"
     echo
 }
 
