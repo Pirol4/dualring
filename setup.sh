@@ -288,6 +288,7 @@ install_dpdk() {
         -Dplatform=native \
         -Dmax_ethports=32 \
         -Denable_kmods=true \
+        -Dexamples=all \
         --prefix=/usr/local
 
     ninja -C build -j"$(nproc)"
