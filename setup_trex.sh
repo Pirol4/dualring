@@ -1,25 +1,37 @@
 #!/bin/bash
 # setup_trex.sh — Instala e configura T-Rex no Servidor 2 (gerador de carga)
 #
-# Pré-requisito: sudo ./setup_dpdk.sh deve ter sido executado antes (hugepages, vfio-pci)
+# Pré-requisito: sudo ./setup.sh deve ter sido executado antes (hugepages, vfio-pci)
 #
 # Uso:
 #   sudo ./setup_trex.sh [--trex-version VER] [--trex-dir DIR] [--port0 BDF] [--port1 BDF]
 #
 # Flags:
 #   --trex-version VER  Versão do T-Rex a baixar (padrão: 3.06)
-#   --trex-dir DIR      Diretório de instalação (padrão: ~/trex)
+#   --trex-dir DIR      Diretório de instalação (padrão: ~/trex do usuário real)
 #   --port0 BDF         Endereço PCI da porta 0 (ex: 0000:41:00.0) — detectado auto se omitido
 #   --port1 BDF         Endereço PCI da porta 1 (ex: 0000:41:00.1) — detectado auto se omitido
+#   --skip-link-check   Pula a verificação de link físico das NICs (para testes)
+#
+# Modelo de execução do T-Rex (IMPORTANTE):
+#   Perfis STL (.py) NÃO rodam em modo batch (-f/-d sem -i) — isso só existe para
+#   STF/ASTF. O fluxo correto é: servidor interativo (t-rex-64 -i) + cliente via
+#   API Python. Os helpers run_trex/collect_baseline gerados aqui seguem esse modelo.
 
 set -euo pipefail
 
 # ─── Configurações ────────────────────────────────────────────────────────────
 
+# Home do usuário real (não /root quando rodando via sudo) — evita instalar
+# o T-Rex em lugar diferente do esperado e permite o chown correto dos perfis
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+
 TREX_VERSION="3.06"
-TREX_DIR="${HOME}/trex"
+TREX_DIR="${REAL_HOME}/trex"
 PORT0=""
 PORT1=""
+SKIP_LINK_CHECK=0
 
 # ─── Parse de argumentos ──────────────────────────────────────────────────────
 
@@ -29,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         --trex-dir)     TREX_DIR="$2";     shift ;;
         --port0)        PORT0="$2";        shift ;;
         --port1)        PORT1="$2";        shift ;;
+        --skip-link-check) SKIP_LINK_CHECK=1 ;;
         *) echo "Argumento desconhecido: $1" >&2; exit 1 ;;
     esac
     shift
@@ -55,11 +68,11 @@ check_prerequisites() {
     local hp_total
     hp_total=$(grep -i 'HugePages_Total' /proc/meminfo | awk '{print $2}')
     if [[ "${hp_total}" -lt 2 ]]; then
-        die "Hugepages insuficientes (${hp_total} disponíveis). Execute setup_dpdk.sh primeiro."
+        die "Hugepages insuficientes (${hp_total} disponíveis). Execute setup.sh primeiro."
     fi
     log "Hugepages OK: ${hp_total} × 1 GiB disponíveis."
 
-    python3 --version &>/dev/null || die "Python 3 não encontrado. Execute setup_dpdk.sh primeiro."
+    python3 --version &>/dev/null || die "Python 3 não encontrado. Execute setup.sh primeiro."
     log "Python 3 OK: $(python3 --version)"
 
     if ! python3 -c "import scapy" &>/dev/null; then
@@ -81,6 +94,51 @@ check_prerequisites() {
             warn "Pacotes rdma-core não instalados — mlx5 PMD pode falhar."
     fi
     log "rdma-core OK."
+}
+
+# ─── 1b. rdma-core moderna (exigida pelo PMD mlx5 do T-Rex) ──────────────────
+#
+# FIX (debug 10/06/2026): o binário mlx5 pré-compilado do T-Rex v3.06
+# (so/x86_64/libmlx5-64.so) exige símbolos MLX5_1.15+ que a rdma-core do
+# Ubuntu 20.04 (v28) não exporta. Erro observado:
+#   EAL: /lib/x86_64-linux-gnu/libmlx5.so.1: version `MLX5_1.15' not found
+# Solução: compilar rdma-core v44 em /usr/local/lib (precedência sobre a do
+# sistema no loader, sem substituir pacotes do apt).
+
+build_rdma_core() {
+    sep "Verificando versão da libmlx5 (símbolos exigidos pelo T-Rex)"
+
+    local current_lib
+    current_lib=$(ldconfig -p | awk '/libmlx5\.so\.1/{print $NF; exit}')
+
+    if [[ -n "${current_lib}" ]] && objdump -T "${current_lib}" 2>/dev/null | grep -q 'MLX5_1.1[5-9]'; then
+        log "libmlx5 atual (${current_lib}) já exporta MLX5_1.15+ — OK."
+        return
+    fi
+
+    log "libmlx5 do sistema é antiga demais para o T-Rex. Compilando rdma-core v44..."
+
+    apt-get install -y --quiet build-essential cmake ninja-build pkg-config \
+        libudev-dev libnl-3-dev libnl-route-3-dev libssl-dev python3-dev cython3 || \
+        die "Falha ao instalar dependências de build da rdma-core."
+
+    local build_dir="/tmp/rdma-core-build"
+    rm -rf "${build_dir}"
+    git clone -b v44.0 --depth 1 https://github.com/linux-rdma/rdma-core.git "${build_dir}" || \
+        die "Falha ao clonar rdma-core."
+
+    mkdir -p "${build_dir}/build"
+    cd "${build_dir}/build"
+    cmake -GNinja -DNO_MAN_PAGES=1 .. || die "Falha no cmake da rdma-core."
+    ninja || die "Falha na compilação da rdma-core."
+    ninja install || die "Falha no install da rdma-core."
+    ldconfig
+    cd - >/dev/null
+
+    # Verificação pós-install
+    objdump -T /usr/local/lib/libmlx5.so.1 2>/dev/null | grep -q 'MLX5_1.1[5-9]' || \
+        die "rdma-core instalada mas símbolo MLX5_1.15+ não encontrado em /usr/local/lib/libmlx5.so.1."
+    log "rdma-core v44 instalada em /usr/local/lib — símbolos MLX5_1.15+ disponíveis."
 }
 
 # ─── 2. Download e extração do T-Rex ─────────────────────────────────────────
@@ -179,6 +237,59 @@ detect_nics() {
     fi
 }
 
+# ─── 3b. Verificação de link físico ──────────────────────────────────────────
+#
+# FIX (debug 10/06/2026): experimento CloudLab foi provisionado sem enlaces nas
+# ConnectX-5 (NO-CARRIER) — o T-Rex subia, mas transmitia 0 pps com link DOWN.
+# Esta verificação falha cedo e com mensagem clara, em vez de deixar o problema
+# aparecer só na hora do tráfego.
+
+check_link_status() {
+    sep "Verificando link físico das NICs"
+
+    if [[ "${SKIP_LINK_CHECK}" -eq 1 ]]; then
+        warn "Verificação de link pulada (--skip-link-check)."
+        return
+    fi
+
+    local failed=0
+    for port in "${PORT0}" "${PORT1}"; do
+        # Descobre o netdev associado ao endereço PCI (mlx5 é bifurcado: netdev coexiste com DPDK)
+        local iface
+        iface=$(ls "/sys/bus/pci/devices/${port}/net/" 2>/dev/null | head -1)
+
+        if [[ -z "${iface}" ]]; then
+            warn "NIC ${port}: sem netdev associado (driver não-bifurcado ou já em vfio-pci) — pulando check de link."
+            continue
+        fi
+
+        # Garante interface administrativamente up (não gera tráfego; só ativa o link)
+        ip link set "${iface}" up 2>/dev/null || true
+        sleep 1
+
+        local carrier speed
+        carrier=$(cat "/sys/class/net/${iface}/carrier" 2>/dev/null || echo 0)
+        speed=$(cat "/sys/class/net/${iface}/speed" 2>/dev/null || echo -1)
+
+        if [[ "${carrier}" != "1" ]]; then
+            warn "NIC ${port} (${iface}): SEM LINK FÍSICO (NO-CARRIER)."
+            failed=1
+        elif [[ "${speed}" -lt 100000 ]]; then
+            warn "NIC ${port} (${iface}): link em ${speed} Mb/s — esperado 100000 (100G)."
+            failed=1
+        else
+            log "NIC ${port} (${iface}): link UP @ ${speed} Mb/s. OK."
+        fi
+    done
+
+    if [[ "${failed}" -eq 1 ]]; then
+        die "Link físico ausente ou abaixo de 100G. Causa típica no CloudLab: o profile do
+experimento não definiu os enlaces de 100G entre os nós (verifique o profile.py —
+os links devem pedir bandwidth=100000000). O T-Rex mostraria 'link: DOWN' e 0 pps.
+Use --skip-link-check apenas para testes sem hardware."
+    fi
+}
+
 # ─── 4. Bind das NICs para o T-Rex ────────────────────────────────────────────
 
 bind_nics() {
@@ -265,33 +376,28 @@ create_traffic_profiles() {
 
     cat > "${PROFILES_DIR}/steady_64b.py" << 'EOF'
 """
-Perfil: fluxo contínuo de pacotes de 64 bytes
-Uso: ./t-rex-64 -f profiles/steady_64b.py -m 100% --port 0 1 -d 60
+Perfil: fluxo continuo de pacotes de 64 bytes (STL).
+
+Uso (console):    start -f profiles/steady_64b.py -m 100% -d 60 -p 0 1
+Uso (helper):     run_trex -f ~/trex/profiles/steady_64b.py -m 100% -d 60
+
+A taxa e controlada pelo -m do start (percentual de line rate ou pps).
 """
 from trex_stl_lib.api import *
 
 class STLSteady64(object):
 
-    def get_streams(self, tunables, **kwargs):
-        parser = STLArgParser()
-        parser.add_argument('--rate-pps', type=float, default=None)
-        args = parser.parse_args(tunables)
-
+    def get_streams(self, direction=0, **kwargs):
         base_pkt = (Ether(src='10:00:00:00:00:01', dst='ff:ff:ff:ff:ff:ff') /
                     IP(src='16.0.0.1', dst='48.0.0.1', ttl=64) /
                     UDP(sport=1025, dport=12))
         pad_len = max(0, 64 - len(base_pkt) - 4)
         pkt = base_pkt / Raw(b'\x00' * pad_len)
 
-        if args.rate_pps:
-            mode = STLTXCont(pps=args.rate_pps)
-        else:
-            mode = STLTXCont()
-
         data_stream = STLStream(
             name='data',
             packet=STLPktBuilder(pkt=pkt),
-            mode=mode,
+            mode=STLTXCont(),
             flow_stats=STLFlowStats(pg_id=1),
         )
 
@@ -318,7 +424,7 @@ from trex_stl_lib.api import *
 
 class STLSteady1500(object):
 
-    def get_streams(self, tunables, **kwargs):
+    def get_streams(self, direction=0, **kwargs):
         base_pkt = (Ether(src='10:00:00:00:00:01', dst='ff:ff:ff:ff:ff:ff') /
                     IP(src='16.0.0.1', dst='48.0.0.1', ttl=64) /
                     UDP(sport=1025, dport=12))
@@ -346,33 +452,33 @@ def register():
     return STLSteady1500()
 EOF
 
-    # FIX: isg espera microsegundos — usa args.idle_us diretamente (não * 1000)
+    # FIX (10/06/2026): STLArgParser não existe na API STL — tunables via kwargs.
+    # FIX: stream com next apontando para si mesmo é inválido — o primitivo correto
+    # para rajadas periódicas é STLTXMultiBurst (pps no burst, ibg entre bursts).
     cat > "${PROFILES_DIR}/bursty_64b.py" << 'EOF'
 """
-Perfil: tráfego bursty de 64 bytes — revela o trade-off leaky DMA.
+Perfil: trafego bursty de 64 bytes — revela o trade-off leaky DMA.
 
 Estrutura de cada ciclo:
-  burst_pkts pacotes a burst_pps  →  idle_us µs de silêncio  →  repete
+  burst_pkts pacotes a burst_pps  →  idle_us de silencio  →  repete
 
-Parâmetros ajustáveis via -t:
-  --burst-pkts N   Pacotes por burst       (padrão: 2048)
-  --burst-pps  N   Taxa durante o burst    (padrão: 100_000_000 = 100 Mpps)
-  --idle-us    N   Pausa entre bursts (µs) (padrão: 10)
+Tunables (via -t no console: start -f ... -t burst_pkts=4096,idle_us=50):
+  burst_pkts   Pacotes por burst       (padrao: 2048)
+  burst_pps    Taxa durante o burst    (padrao: 1e8 = 100 Mpps)
+  idle_us      Pausa entre bursts (us) (padrao: 10)
 
-Uso:
-  ./t-rex-64 -f profiles/bursty_64b.py --port 0 1 -d 60
-  ./t-rex-64 -f profiles/bursty_64b.py -t --burst-pkts 4096 --idle-us 50 --port 0 1 -d 60
+Uso (console):  start -f profiles/bursty_64b.py -m 1 -d 60 -p 0 1
+Uso (helper):   run_trex -f ~/trex/profiles/bursty_64b.py -m 1 -d 60
 """
 from trex_stl_lib.api import *
 
 class STLBursty64(object):
 
-    def get_streams(self, tunables, **kwargs):
-        parser = STLArgParser()
-        parser.add_argument('--burst-pkts', type=int,   default=2048)
-        parser.add_argument('--burst-pps',  type=float, default=100_000_000)
-        parser.add_argument('--idle-us',    type=float, default=10)
-        args = parser.parse_args(tunables)
+    def get_streams(self, direction=0, burst_pkts=2048, burst_pps=100000000.0,
+                    idle_us=10.0, **kwargs):
+        burst_pkts = int(burst_pkts)
+        burst_pps = float(burst_pps)
+        idle_us = float(idle_us)
 
         base_pkt = (Ether(src='10:00:00:00:00:01', dst='ff:ff:ff:ff:ff:ff') /
                     IP(src='16.0.0.1', dst='48.0.0.1', ttl=64) /
@@ -380,17 +486,17 @@ class STLBursty64(object):
         pad_len = max(0, 64 - len(base_pkt) - 4)
         pkt = base_pkt / Raw(b'\x00' * pad_len)
 
-        # isg no T-Rex STL é em MICROSEGUNDOS — passa idle_us diretamente
+        # ibg (inter-burst gap) e em MICROSEGUNDOS; count alto = duracao limitada pelo -d
         burst_stream = STLStream(
             name='burst',
             packet=STLPktBuilder(pkt=pkt),
-            mode=STLTXBurst(
-                pps=args.burst_pps,
-                total_pkts=args.burst_pkts,
+            mode=STLTXMultiBurst(
+                pps=burst_pps,
+                pkts_per_burst=burst_pkts,
+                ibg=idle_us,
+                count=1000000,
             ),
             flow_stats=STLFlowStats(pg_id=3),
-            isg=args.idle_us,   # gap em µs antes de cada ativação do burst
-            next='burst',       # loop: re-activa o stream após cada burst
         )
 
         lat_stream = STLStream(
@@ -407,7 +513,11 @@ def register():
     return STLBursty64()
 EOF
 
-    log "Perfis criados em ${PROFILES_DIR}:"
+    # FIX (10/06/2026): script roda como root, mas o usuário precisa editar os
+    # perfis sem sudo (Permission denied observado ao regravar steady_64b.py)
+    chown -R "${REAL_USER}:$(id -gn "${REAL_USER}")" "${TREX_DIR}"
+
+    log "Perfis criados em ${PROFILES_DIR} (dono: ${REAL_USER}):"
     log "  steady_64b.py   — fluxo contínuo, 64B"
     log "  steady_1500b.py — fluxo contínuo, 1500B"
     log "  bursty_64b.py   — tráfego bursty, 64B"
@@ -420,23 +530,115 @@ create_run_helper() {
 
     local trex_bin="${TREX_DIR}/v${TREX_VERSION}"
 
-    # FIX: run_trex usa modo batch (sem -i) — -i é modo servidor, incompatível com -f/-m/-d
+    # FIX (10/06/2026): perfis STL (.py) NÃO funcionam em modo batch — o trex-cfg
+    # rejeita com "Python files can not be used with STF mode". O modelo correto:
+    # servidor interativo (t-rex-64 -i) + cliente via API Python (STLClient).
+    # O run_trex abaixo sobe o servidor se necessário e delega ao run_trex_stl.py.
+
     cat > /usr/local/bin/run_trex << EOF
 #!/bin/bash
-# Wrapper para o T-Rex em modo batch (stateless).
-# Uso: run_trex -f <perfil> -m <taxa> -d <duração_s> --port 0 1
-# Exemplo: run_trex -f ~/trex/profiles/steady_64b.py -m 50% -d 30 --port 0 1
+# Executa um perfil STL no T-Rex (sobe o servidor automaticamente se preciso).
+# Uso: run_trex -f <perfil.py> -m <taxa> -d <duração_s>
+# Ex.:  run_trex -f ~/trex/profiles/steady_64b.py -m 10% -d 30
+# Variáveis: TREX_CORES (padrão 4) controla os cores do servidor.
 
-TREX_BIN="${TREX_DIR}/v${TREX_VERSION}"
-cd "\${TREX_BIN}"
-sudo ./t-rex-64 --cfg /etc/trex_cfg.yaml "\$@"
+set -euo pipefail
+TREX_BIN="${trex_bin}"
+TREX_CORES="\${TREX_CORES:-4}"
+
+if ! pgrep -f '_t-rex-64' > /dev/null; then
+    echo "[run_trex] Servidor T-Rex não está rodando — iniciando (\${TREX_CORES} cores)..."
+    sudo bash -c "cd '\${TREX_BIN}' && nohup ./t-rex-64 -i -c \${TREX_CORES} --cfg /etc/trex_cfg.yaml > /tmp/trex_server.log 2>&1 &"
+    for i in \$(seq 1 60); do
+        ss -ltn 2>/dev/null | grep -q ':4501' && break
+        sleep 1
+    done
+    if ! ss -ltn 2>/dev/null | grep -q ':4501'; then
+        echo "[run_trex] ERRO: servidor não subiu em 60s. Log: /tmp/trex_server.log" >&2
+        tail -20 /tmp/trex_server.log >&2 || true
+        exit 1
+    fi
+    echo "[run_trex] Servidor pronto (porta 4501)."
+fi
+
+exec python3 /usr/local/bin/run_trex_stl.py "\$@"
 EOF
     chmod +x /usr/local/bin/run_trex
 
-    # FIX: collect_baseline captura stdout em vez de usar --output-file (flag inexistente)
+    cat > /usr/local/bin/run_trex_stl.py << EOF
+#!/usr/bin/env python3
+"""Cliente STL: conecta no servidor T-Rex local, roda um perfil e imprime stats."""
+import argparse
+import json
+import os
+import sys
+
+TREX_API = "${trex_bin}/automation/trex_control_plane/interactive"
+sys.path.insert(0, TREX_API)
+from trex.stl.api import STLClient, STLProfile  # noqa: E402
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-f", dest="profile", required=True, help="caminho do perfil .py")
+    ap.add_argument("-m", dest="mult", default="10%", help="taxa (ex.: 10%%, 1mpps)")
+    ap.add_argument("-d", dest="duration", type=float, default=30, help="duração em s")
+    ap.add_argument("-p", dest="ports", type=int, nargs="+", default=[0, 1])
+    args = ap.parse_args()
+
+    profile_path = os.path.abspath(os.path.expanduser(args.profile))
+    if not os.path.isfile(profile_path):
+        sys.exit("Perfil não encontrado: %s" % profile_path)
+
+    c = STLClient()
+    c.connect()
+    try:
+        ports = args.ports
+        c.reset(ports=ports)
+        prof = STLProfile.load_py(profile_path)
+        c.add_streams(prof.get_streams(), ports=ports)
+        c.clear_stats()
+        c.start(ports=ports, mult=args.mult, duration=args.duration, force=True)
+        c.wait_on_traffic(ports=ports)
+
+        s = c.get_stats()
+        tx = sum(s[p]["opackets"] for p in ports)
+        rx = sum(s[p]["ipackets"] for p in ports)
+        loss = tx - rx
+        loss_pct = (100.0 * loss / tx) if tx else 0.0
+
+        print("")
+        print("=== RESULTADO ===")
+        print("TX total : %d" % tx)
+        print("RX total : %d" % rx)
+        print("Perda    : %d (%.4f%%)" % (loss, loss_pct))
+        for p in ports:
+            print("  porta %d: tx=%d rx=%d" % (p, s[p]["opackets"], s[p]["ipackets"]))
+
+        # Linha JSON para parsing automatizado (collect_baseline / scripts de análise)
+        try:
+            summary = {
+                "tx": tx, "rx": rx, "loss": loss, "loss_pct": loss_pct,
+                "ports": {str(p): {"tx": s[p]["opackets"], "rx": s[p]["ipackets"]}
+                          for p in ports},
+                "latency": s.get("latency", {}),
+            }
+            print("JSON_STATS: %s" % json.dumps(summary, default=str))
+        except Exception as e:
+            print("JSON_STATS_ERROR: %s" % e)
+    finally:
+        c.disconnect()
+
+if __name__ == "__main__":
+    main()
+EOF
+    chmod +x /usr/local/bin/run_trex_stl.py
+
+    # FIX (10/06/2026): collect_baseline reescrito sobre o run_trex (API STL).
+    # A versão anterior usava modo batch (-f/-d direto no t-rex-64), que não
+    # existe para perfis STL.
     cat > /usr/local/bin/collect_baseline << 'SCRIPT'
 #!/bin/bash
-# Executa N repetições de um perfil T-Rex e salva os resultados.
+# Executa N repetições de um perfil STL e salva os resultados.
 #
 # Uso: collect_baseline <perfil> <duracao_s> <taxa> [repeticoes]
 # Exemplo: collect_baseline ~/trex/profiles/steady_64b.py 60 100% 10
@@ -447,7 +649,6 @@ PROFILE="${1:-}"
 DURATION="${2:-60}"
 RATE="${3:-100%}"
 REPS="${4:-10}"
-TREX_DIR="$(ls -d ~/trex/v* 2>/dev/null | sort -V | tail -1)"
 
 [[ -n "${PROFILE}" ]] || { echo "Uso: collect_baseline <perfil> <duracao_s> <taxa> [repeticoes]"; exit 1; }
 [[ -f "${PROFILE}" ]] || { echo "Perfil não encontrado: ${PROFILE}"; exit 1; }
@@ -463,36 +664,35 @@ echo "  Taxa     : ${RATE}"
 echo "  Saída    : ${OUTDIR}"
 echo ""
 
+FAILED=0
 for ((i=1; i<=REPS; i++)); do
-    echo -n "[$(date +%H:%M:%S)] Run ${i}/${REPS}... "
+    echo "[$(date +%H:%M:%S)] Run ${i}/${REPS}..."
 
-    cd "${TREX_DIR}"
-    # Redireciona stdout para arquivo — T-Rex não tem flag --output-file
-    sudo ./t-rex-64 \
-        --cfg /etc/trex_cfg.yaml \
-        -f "${PROFILE}" \
-        -m "${RATE}" \
-        -d "${DURATION}" \
-        --port 0 1 \
-        --no-watchdog \
-        > "${OUTDIR}/run_${i}.txt" \
-        2>"${OUTDIR}/run_${i}.stderr" || {
-            echo "ERRO (ver ${OUTDIR}/run_${i}.stderr)"
-            continue
-        }
+    if run_trex -f "${PROFILE}" -m "${RATE}" -d "${DURATION}" \
+        > "${OUTDIR}/run_${i}.txt" 2>"${OUTDIR}/run_${i}.stderr"; then
+        echo "  OK → ${OUTDIR}/run_${i}.txt"
+    else
+        echo "  ERRO (ver ${OUTDIR}/run_${i}.stderr)"
+        FAILED=$((FAILED + 1))
+    fi
 
-    echo "OK → ${OUTDIR}/run_${i}.txt"
     [[ $i -lt $REPS ]] && sleep 5
 done
 
+# Consolida as linhas JSON de todas as runs num único arquivo para análise
+grep -h '^JSON_STATS:' "${OUTDIR}"/run_*.txt 2>/dev/null | sed 's/^JSON_STATS: //' \
+    > "${OUTDIR}/all_runs.jsonl" || true
+
 echo ""
-echo "[$(date +%H:%M:%S)] Coleta concluída. Resultados em: ${OUTDIR}"
+echo "[$(date +%H:%M:%S)] Coleta concluída (${FAILED} falhas). Resultados em: ${OUTDIR}"
+echo "  Resumo JSON por run: ${OUTDIR}/all_runs.jsonl"
 SCRIPT
     chmod +x /usr/local/bin/collect_baseline
 
     log "Scripts auxiliares criados:"
-    log "  run_trex          — inicia o T-Rex (modo batch)"
-    log "  collect_baseline  — executa N repetições e salva resultados"
+    log "  run_trex          — sobe o servidor (-i) se preciso e roda o perfil via API STL"
+    log "  run_trex_stl.py   — cliente Python da API STL (usado pelo run_trex)"
+    log "  collect_baseline  — executa N repetições via run_trex e consolida JSON"
 }
 
 # ─── 8. Resumo final ─────────────────────────────────────────────────────────
@@ -518,7 +718,7 @@ print_summary() {
     echo "│                                                                 │"
     echo "│  2. Teste inicial (30s, 10% da linha):                         │"
     echo "│     run_trex -f ~/trex/profiles/steady_64b.py -m 10% -d 30     │"
-    echo "│     --port 0 1                                                  │"
+    echo "│     (sobe o servidor T-Rex automaticamente se preciso)          │"
     echo "│                                                                 │"
     echo "│  3. Coletar baseline completo (10 repetições, 60s cada):       │"
     echo "│     collect_baseline ~/trex/profiles/steady_64b.py 60 100% 10  │"
@@ -542,9 +742,11 @@ main() {
     log "Iniciando setup T-Rex v${TREX_VERSION} — $(uname -r) — $(date)"
 
     check_prerequisites
+    build_rdma_core
     install_trex
     fix_python38_compat
     detect_nics
+    check_link_status
     bind_nics
     generate_trex_config
     create_traffic_profiles
