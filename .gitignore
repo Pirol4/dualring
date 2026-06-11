@@ -1,0 +1,34 @@
+# Binários compilados
+mvp1/dual_ring_fwd
+src/server
+src/client
+*.o
+*.a
+*.so
+
+# DPDK build artifacts
+*.d
+*.map
+
+# Arquivos de teste local
+*.pcap
+*.pcapng
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Resultados brutos (commitar só os CSVs processados)
+results/raw/
+*.jsonl
+
+# Logs e saídas de experimento
+*.log
+run*.txt
+
+# Editor e OS
+.vscode/
+*.swp
+*~
+.DS_Store
