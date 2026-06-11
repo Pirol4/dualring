@@ -108,15 +108,24 @@ check_prerequisites() {
 build_rdma_core() {
     sep "Verificando versão da libmlx5 (símbolos exigidos pelo T-Rex)"
 
+    # || true: evita que set -e mate o script se ldconfig ou awk saírem com erro
     local current_lib
-    current_lib=$(ldconfig -p | awk '/libmlx5\.so\.1/{print $NF; exit}')
+    current_lib=$(ldconfig -p | awk '/libmlx5\.so\.1/{print $NF; exit}' || true)
+    log "libmlx5 encontrada: ${current_lib:-<nenhuma>}"
 
-    if [[ -n "${current_lib}" ]] && objdump -T "${current_lib}" 2>/dev/null | grep -q 'MLX5_1.1[5-9]'; then
+    # Verifica símbolos em etapas separadas para não disparar pipefail dentro de if
+    local has_symbols=0
+    if [[ -n "${current_lib}" ]] && command -v objdump &>/dev/null; then
+        objdump -T "${current_lib}" 2>/dev/null | grep -q 'MLX5_1.1[5-9]' \
+            && has_symbols=1 || has_symbols=0
+    fi
+
+    if [[ "${has_symbols}" -eq 1 ]]; then
         log "libmlx5 atual (${current_lib}) já exporta MLX5_1.15+ — OK."
         return
     fi
 
-    log "libmlx5 do sistema é antiga demais para o T-Rex. Compilando rdma-core v44..."
+    log "libmlx5 do sistema é antiga demais (ou não encontrada) para o T-Rex. Compilando rdma-core v44..."
 
     apt-get install -y --quiet build-essential cmake ninja-build pkg-config \
         libudev-dev libnl-3-dev libnl-route-3-dev libssl-dev python3-dev cython3 || \
