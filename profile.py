@@ -1,4 +1,5 @@
-"""Dois nós d6515 com dois enlaces de 100G (ConnectX-5) para benchmarking DPDK/T-Rex."""
+# -*- coding: utf-8 -*-
+"""Two d6515 nodes with two 100G links (ConnectX-5) for DPDK/T-Rex benchmarking."""
 import geni.portal as portal
 import geni.rspec.pg as pg
 
@@ -15,13 +16,12 @@ client = request.RawPC("client")
 client.hardware_type = "d6515"
 client.disk_image = UBUNTU20
 
-# Dois links ponta a ponta a 100G (bandwidth em Kbps: 100G = 100.000.000)
+# Two point-to-point links at 100G (bandwidth in Kbps: 100G = 100000000)
 for i in range(2):
-    link = request.Link(f"link{i}")
+    link = request.Link("link%d" % i)
     link.bandwidth = 100000000
-    link.addInterface(server.addInterface(f"s_if{i}"))
-    link.addInterface(client.addInterface(f"c_if{i}"))
-    link.best_effort = True        # evita rejeição por reserva de banda na malha
-    link.setNoBandwidthShaping()   # sem shaping — queremos line rate cru
+    link.addInterface(server.addInterface("s_if%d" % i))
+    link.addInterface(client.addInterface("c_if%d" % i))
+    link.best_effort = True
 
 pc.printRequestRSpec(request)
