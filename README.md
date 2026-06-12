@@ -130,6 +130,96 @@ timeout -s INT 8 ./dual_ring_fwd --no-huge -m 700 -l 0 \
 
 ---
 
+## Coletando experimentos (workflow completo)
+
+A coleta usa dois scripts sincronizados por um `exp_id` — um timestamp gerado no servidor que
+garante que os dados de rede (client) e LLC (server) ficam na mesma pasta.
+
+Você precisa de **3 terminais abertos ao mesmo tempo**:
+
+### Terminal 1 — Servidor (rodar a implementação)
+
+```bash
+# Exemplo: baseline l2fwd
+sudo ~/dpdk/build/examples/dpdk-l2fwd \
+    -l 0-15 -n 4 \
+    -a 0000:41:00.0 -a 0000:41:00.1 \
+    -- -p 0x3 -T 1
+
+# Exemplo: dual_ring_fwd (MVP 1)
+cd ~/POC_DualRingProject/mvp1
+export PKG_CONFIG_PATH=$(find ~/dpdk/build -name 'libdpdk.pc' -exec dirname {} \; | head -1)
+make
+sudo ./dual_ring_fwd -l 0-15 -n 4 -a 0000:41:00.0 -a 0000:41:00.1 -- -T 1
+```
+
+Deixe rodando. Não feche este terminal.
+
+### Terminal 2 — Servidor (monitor LLC)
+
+```bash
+# Instale perf se ainda não estiver (só precisa uma vez por alocação CloudLab)
+sudo apt-get install -y linux-tools-$(uname -r) linux-tools-generic
+
+# Gere o exp_id e anote o valor
+exp_id=$(date +%Y%m%d_%H%M%S)
+echo "EXP_ID: $exp_id"
+
+# Inicie o monitor — fica aguardando
+sudo bash ~/POC_DualRingProject/scripts/collect_server.sh l2fwd $exp_id
+```
+
+Quando aparecer `>>> INICIE o collect_client.sh no gerador AGORA <<<`, vá para o Terminal 3.
+
+### Terminal 3 — Client/gerador (T-Rex)
+
+```bash
+# Substitua o exp_id pelo valor exato do Terminal 2
+exp_id=20260611_174501
+
+mkdir -p ~/results
+bash ~/POC_DualRingProject/scripts/collect_client.sh l2fwd $exp_id
+```
+
+A coleta dura ~12 minutos (2 perfis × 5 reps × 60 s + intervalos). Ao terminar, o Terminal 2
+também encerra automaticamente. Encerre o Terminal 1 com `Ctrl+C`.
+
+**Parâmetros fixos** (não altere entre implementações para garantir comparabilidade):
+- `steady_64b` @ 3% line rate — verifica operação normal sem perda
+- `bursty_64b` @ multiplicador 1 — expõe o trade-off Leaky DMA
+- 5 repetições, 60 s cada, 10 s de intervalo entre reps
+
+### Salvando os resultados (antes de encerrar o CloudLab)
+
+As máquinas CloudLab são efêmeras. Salve os resultados antes de encerrar o experimento.
+
+**Opção 1 — git push** (recomendado, mantém histórico):
+```bash
+# No servidor (e também no client — rode em ambos)
+cd ~/POC_DualRingProject
+git add results/
+git commit -m "results: l2fwd 20260611_174501"
+
+# Configure credenciais se necessário (token do GitHub):
+git remote set-url origin https://<TOKEN>@github.com/Pirol4/POC_DualRingProject.git
+git push
+```
+
+**Opção 2 — scp para máquina local** (do seu computador):
+```bash
+# Baixa todos os resultados do servidor para ~/Downloads/results_server/
+scp -r -P 22 pirola@server.pirola-307281.aos-ufmg-dcc831-pg0.utah.cloudlab.us:~/results/ \
+    ~/Downloads/results_server/
+
+# Baixa todos os resultados do client para ~/Downloads/results_client/
+scp -r -P 22 pirola@<IP_DO_CLIENT>:~/results/ ~/Downloads/results_client/
+```
+
+> Os arquivos `.jsonl` (dados brutos de cada run) estão no `.gitignore`. Para commitar os dados
+> brutos também, use `git add -f results/` no lugar de `git add results/`.
+
+---
+
 ## Sistemas comparados
 
 | Sistema | Descrição |

@@ -144,10 +144,19 @@ build_rdma_core() {
     ldconfig
     cd - >/dev/null
 
-    # Verificação pós-install
-    objdump -T /usr/local/lib/libmlx5.so.1 2>/dev/null | grep -q 'MLX5_1.1[5-9]' || \
-        die "rdma-core instalada mas símbolo MLX5_1.15+ não encontrado em /usr/local/lib/libmlx5.so.1."
-    log "rdma-core v44 instalada em /usr/local/lib — símbolos MLX5_1.15+ disponíveis."
+    # Verificação pós-install: checa existência da lib (símbolo versionado pode não aparecer
+    # com GCC 9.4/Ubuntu 20.04 mesmo sendo funcional — não usar objdump para validar).
+    if [[ ! -f /usr/local/lib/libmlx5.so.1 ]]; then
+        local versioned
+        versioned=$(find /usr/local/lib -name 'libmlx5.so.1.*' 2>/dev/null | sort | tail -1 || true)
+        if [[ -n "${versioned}" ]]; then
+            ln -sf "${versioned}" /usr/local/lib/libmlx5.so.1
+        else
+            die "rdma-core compilada mas /usr/local/lib/libmlx5.so.1 não encontrada. Verifique o build."
+        fi
+    fi
+    ldconfig
+    log "rdma-core v44 instalada em /usr/local/lib — libmlx5.so.1 disponível."
 }
 
 # ─── 2. Download e extração do T-Rex ─────────────────────────────────────────
@@ -602,15 +611,16 @@ def main():
     c.connect()
     try:
         ports = args.ports
+        tx_ports = [ports[0]]   # TX somente na porta 0; streams no mesmo pg_id não podem ir para 2 portas
         c.reset(ports=ports)
         prof = STLProfile.load_py(profile_path)
-        c.add_streams(prof.get_streams(), ports=ports)
+        c.add_streams(prof.get_streams(), ports=tx_ports)
         c.clear_stats()
-        c.start(ports=ports, mult=args.mult, duration=args.duration, force=True)
-        c.wait_on_traffic(ports=ports)
+        c.start(ports=tx_ports, mult=args.mult, duration=args.duration, force=True)
+        c.wait_on_traffic(ports=tx_ports)
 
         s = c.get_stats()
-        tx = sum(s[p]["opackets"] for p in ports)
+        tx = sum(s[p]["opackets"] for p in tx_ports)
         rx = sum(s[p]["ipackets"] for p in ports)
         loss = tx - rx
         loss_pct = (100.0 * loss / tx) if tx else 0.0

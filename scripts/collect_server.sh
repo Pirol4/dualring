@@ -23,8 +23,13 @@ IMPL="${1:-}"
 EXP_ID="${2:-$(date +%Y%m%d_%H%M%S)}"
 DURATION="${3:-800}"
 
-OUTDIR="$HOME/results/${IMPL}/${EXP_ID}"
+# Resolve o home do usuário real (SUDO_USER) — sem isso, sudo coloca tudo em /root/results/
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+
+OUTDIR="${REAL_HOME}/results/${IMPL}/${EXP_ID}"
 mkdir -p "${OUTDIR}"
+chown "${REAL_USER}:$(id -gn "${REAL_USER}" 2>/dev/null || echo "${REAL_USER}")" "${OUTDIR}"
 
 LLC_OUT="${OUTDIR}/llc_stats.txt"
 PERF_INTERVAL_MS=5000   # amostragem a cada 5s

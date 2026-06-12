@@ -79,10 +79,10 @@ setup_dependencies() {
         libibumad-dev libibmad-dev || \
         warn "Pacotes RDMA não encontrados — PMD mlx5 pode não compilar"
 
-    # Opcional: ferramentas de diagnóstico
-    apt-get install -y \
-        linux-tools-$(uname -r) linux-tools-generic \
-        perf sysstat || true
+    # Ferramentas de diagnóstico e performance
+    # Nota: o pacote chama "linux-tools-$(uname -r)" — não existe pacote "perf" no Ubuntu 20.04.
+    apt-get install -y linux-tools-$(uname -r) linux-tools-generic sysstat || \
+        warn "linux-tools não instalado — verifique se linux-tools-$(uname -r) existe para este kernel"
 
     log "Dependências instaladas."
 }
