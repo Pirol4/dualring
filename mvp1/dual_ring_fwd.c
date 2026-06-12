@@ -60,7 +60,7 @@
 
 /* ─── Configuração (CLI) ─────────────────────────────────────────────────── */
 
-static unsigned int fast_mbufs       = 2048;   /* tamanho do fast pool        */
+static unsigned int fast_mbufs       = 8192;   /* tamanho do fast pool — deve ser >> nb_rxd */
 static unsigned int burst_mbufs      = 65536;  /* tamanho do burst pool (DRAM)*/
 static unsigned int burst_ring_size  = 16384;  /* capacidade do burst ring    */
 static unsigned int spill_watermark  = 256;    /* avail mínimo do fast pool   */
@@ -262,11 +262,19 @@ port_init(uint16_t port, uint16_t nb_ports)
     int ret;
 
     memset(&port_conf, 0, sizeof(port_conf));
-    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
 
     ret = rte_eth_dev_info_get(port, &dev_info);
     if (ret != 0)
         return ret;
+
+    /* mlx5 bifurcado: sem RSS o PMD não cria regras de flow steering e o
+     * tráfego vai para o kernel em vez das filas DPDK. RSS com 1 fila
+     * distribui tudo para queue 0 — é o que queremos. */
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    port_conf.rx_adv_conf.rss_conf.rss_key = NULL;   /* chave padrão do driver */
+    port_conf.rx_adv_conf.rss_conf.rss_hf =
+        (RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP) &
+        dev_info.flow_type_rss_offloads;              /* só o que o HW suporta  */
 
     struct port_ctx *ctx = &g_ctx[port];
     ctx->tx_port = (nb_ports >= 2) ? (port ^ 1) : port;
@@ -305,6 +313,18 @@ port_init(uint16_t port, uint16_t nb_ports)
     ret = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
     if (ret != 0)
         return ret;
+
+    /* Garante que o fast pool tem mbufs suficientes para a fila de RX.
+     * O PMD pode ter ajustado nb_rxd acima de RX_RING_SIZE; sem headroom
+     * suficiente o pool esgota e o hardware descarta todos os pacotes. */
+    if ((unsigned int)nb_rxd >= fast_mbufs) {
+        rte_exit(EXIT_FAILURE,
+            "Porta %u: nb_rxd ajustado para %u >= fast_mbufs %u. "
+            "Aumente --fast-mbufs para pelo menos %u.\n",
+            port, nb_rxd, fast_mbufs, nb_rxd * 4);
+    }
+    printf("Porta %u: nb_rxd=%u nb_txd=%u (fast_pool=%u, headroom=%u)\n",
+           port, nb_rxd, nb_txd, fast_mbufs, fast_mbufs - nb_rxd);
 
     /* Fila de RX alimentada pelo FAST pool — este é o ponto-chave         */
     ret = rte_eth_rx_queue_setup(port, 0, nb_rxd,
