@@ -593,7 +593,10 @@ import sys
 
 TREX_API = "${trex_bin}/automation/trex_control_plane/interactive"
 sys.path.insert(0, TREX_API)
-from trex.stl.api import STLClient, STLProfile  # noqa: E402
+# star import: traz STLClient, STLProfile, STLStream, STLTXCont, STLPktBuilder
+# E as classes scapy bundled (Ether, IP, UDP, ...) do mesmo scapy que o T-Rex
+# usa internamente — evita conflito de tipo entre scapy do sistema e do T-Rex.
+from trex.stl.api import *  # noqa: E402, F401, F403
 
 def main():
     ap = argparse.ArgumentParser()
@@ -611,17 +614,42 @@ def main():
     c.connect()
     try:
         ports = args.ports
-        tx_ports = [ports[0]]   # TX somente na porta 0; streams no mesmo pg_id não podem ir para 2 portas
+        tx_ports = [ports[0]]
+        rx_ports = [p for p in ports if p not in tx_ports]
+
         c.reset(ports=ports)
+        c.set_port_attr(ports=ports, promiscuous=True)
+
+        if rx_ports:
+            # Null stream continuo de 1 pps para port 1.
+            # Iniciado com mult="1" (1x base rate = 1 pps) — separado do
+            # c.start() do port 0 para evitar amplificacao pelo --mult da CLI.
+            # Manter o port em estado TX-ativo e critico: quando o port vai
+            # IDLE (ex.: apos STLTXSingleBurst), o T-Rex desabilita promiscuous
+            # e o NIC para de aceitar dst=port0_MAC, causando 100% de perda.
+            _pkt = STLPktBuilder(
+                pkt=Ether(dst="ff:ff:ff:ff:ff:ff") /
+                    IP(dst="192.0.2.1") /
+                    UDP(dport=9))
+            _null = STLStream(name="_rx_activate", packet=_pkt,
+                              mode=STLTXCont(pps=1))
+            c.add_streams([_null], ports=rx_ports)
+
         prof = STLProfile.load_py(profile_path)
         c.add_streams(prof.get_streams(), ports=tx_ports)
         c.clear_stats()
+
+        # Inicia port TX com o mult do usuario
         c.start(ports=tx_ports, mult=args.mult, duration=args.duration, force=True)
+        # Inicia port RX com mult="1" (= 1 pps fixo, sem amplificacao)
+        if rx_ports:
+            c.start(ports=rx_ports, mult="1", duration=args.duration, force=True)
+
         c.wait_on_traffic(ports=tx_ports)
 
         s = c.get_stats()
         tx = sum(s[p]["opackets"] for p in tx_ports)
-        rx = sum(s[p]["ipackets"] for p in ports)
+        rx = sum(s[p]["ipackets"] for p in rx_ports)
         loss = tx - rx
         loss_pct = (100.0 * loss / tx) if tx else 0.0
 

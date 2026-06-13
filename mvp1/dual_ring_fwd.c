@@ -71,8 +71,17 @@ static bool         force_spill      = false;  /* p/ teste: spill sempre      */
 
 static volatile bool force_quit = false;
 
+/* Pool único compartilhado por todas as portas.
+ * Com pools por porta, cada rte_eth_rx_queue_setup registra o MR apenas no
+ * Protection Domain da sua porta. Ao fazer TX cross-port (port 0 → port 1)
+ * o hardware recebe um lkey inválido e descarta silenciosamente os pacotes.
+ * Um pool compartilhado faz o rx_queue_setup de cada porta registrar o mesmo
+ * bloco de memória em ambos os PDs, tornando os mbufs válidos para TX em
+ * qualquer porta — exatamente o que o l2fwd faz. */
+static struct rte_mempool *shared_fast_pool;
+
 struct port_ctx {
-    struct rte_mempool *fast_pool;
+    struct rte_mempool *fast_pool;   /* aponta para shared_fast_pool */
     struct rte_mempool *burst_pool;
     struct rte_ring    *burst_ring;
     uint16_t            tx_port;     /* porta de saída (par: 0<->1)          */
@@ -124,18 +133,18 @@ print_stats(void)
 
 /* ─── Datapath ───────────────────────────────────────────────────────────── */
 
-/* Swap de MACs origem/destino — mesmo trabalho por pacote do l2fwd,
- * mantendo a comparação justa com o baseline. */
+/* Reescreve dst MAC igual ao l2fwd (02:00:00:00:00:tx_port).
+ * mac_swap simples coloca T-Rex_port0_MAC como dst no port 1; o mlx5
+ * bifurcado do T-Rex filtra esse frame no DMAC filter (cross-port).
+ * MACs locally-administered (02:xx) não pertencem a nenhuma porta real
+ * e passam pelo filtro sem precisar de promiscuous mode. */
 static inline void
-mac_swap(struct rte_mbuf *m)
+mac_update(struct rte_mbuf *m, uint16_t tx_port)
 {
     struct rte_ether_hdr *eth =
         rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-    struct rte_ether_addr tmp;
-
-    rte_ether_addr_copy(&eth->src_addr, &tmp);
-    rte_ether_addr_copy(&eth->dst_addr, &eth->src_addr);
-    rte_ether_addr_copy(&tmp, &eth->dst_addr);
+    uint64_t *dst = (uint64_t *)&eth->dst_addr.addr_bytes[0];
+    *dst = 0x000000000002 + ((uint64_t)tx_port << 40);
 }
 
 static inline uint16_t
@@ -192,7 +201,7 @@ drain_burst_ring(uint16_t port)
         return;
 
     for (unsigned int i = 0; i < n; i++)
-        mac_swap(pkts[i]);
+        mac_update(pkts[i], ctx->tx_port);
 
     uint16_t sent = tx_pkts(ctx->tx_port, pkts, n);
     g_stats[port].fwd_burst += sent;
@@ -230,7 +239,7 @@ lcore_main(__rte_unused void *arg)
                     spill_pkts(port, pkts, nb);
                 } else {
                     for (uint16_t i = 0; i < nb; i++)
-                        mac_swap(pkts[i]);
+                        mac_update(pkts[i], ctx->tx_port);
                     uint16_t sent = tx_pkts(ctx->tx_port, pkts, nb);
                     g_stats[port].fwd_fast += sent;
                 }
@@ -267,26 +276,24 @@ port_init(uint16_t port, uint16_t nb_ports)
     if (ret != 0)
         return ret;
 
-    /* mlx5 bifurcado: sem RSS o PMD não cria regras de flow steering e o
-     * tráfego vai para o kernel em vez das filas DPDK. RSS com 1 fila
-     * distribui tudo para queue 0 — é o que queremos. */
-    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-    port_conf.rx_adv_conf.rss_conf.rss_key = NULL;   /* chave padrão do driver */
-    port_conf.rx_adv_conf.rss_conf.rss_hf =
-        (RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP) &
-        dev_info.flow_type_rss_offloads;              /* só o que o HW suporta  */
+    /* mq_mode = NONE (padrão): mesma configuração do l2fwd de referência.
+     * RSS foi adicionado anteriormente para corrigir 0 pacotes recebidos,
+     * mas o problema real era fast_mbufs insuficiente (2048 com nb_rxd=1024
+     * deixava headroom zero). Com fast_mbufs=8192 o pool tem espaço e o
+     * mlx5 cria as regras de flow steering corretas sem RSS.
+     * Manter RSS habilitado altera internamente o QP/SQ do mlx5 de modo que
+     * o TX cross-port (porta 0 → porta 1) falha silenciosamente no hardware
+     * mesmo com rte_eth_tx_burst retornando sent=n. */
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
 
     struct port_ctx *ctx = &g_ctx[port];
     ctx->tx_port = (nb_ports >= 2) ? (port ^ 1) : port;
 
-    /* FAST POOL — pequeno, alvo: residência na LLC */
-    snprintf(name, sizeof(name), "fast_pool_p%u", port);
-    ctx->fast_pool = rte_pktmbuf_pool_create(name, fast_mbufs,
-        RTE_MIN(256U, fast_mbufs / 2), 0, RTE_MBUF_DEFAULT_BUF_SIZE,
-        rte_eth_dev_socket_id(port));
-    if (ctx->fast_pool == NULL)
-        rte_exit(EXIT_FAILURE, "Falha ao criar fast pool da porta %u: %s\n",
-                 port, rte_strerror(rte_errno));
+    /* FAST POOL — usa o pool compartilhado criado em main().
+     * Ao chamar rx_queue_setup com o mesmo pool em todas as portas, o mlx5
+     * registra a memória como MR em todos os Protection Domains, tornando
+     * os mbufs válidos para TX cross-port sem lkey inválido. */
+    ctx->fast_pool = shared_fast_pool;
 
     /* BURST POOL — grande, DRAM */
     snprintf(name, sizeof(name), "burst_pool_p%u", port);
@@ -418,14 +425,34 @@ main(int argc, char **argv)
         printf("AVISO: número ímpar de portas (%u) — última porta ecoa "
                "em si mesma\n", nb_ports);
 
+    /* Pool compartilhado criado antes dos port_init para que o rx_queue_setup
+     * de cada porta registre a mesma memória em todos os PDs mlx5. */
+    shared_fast_pool = rte_pktmbuf_pool_create(
+        "fast_pool_shared", fast_mbufs,
+        RTE_MIN(256U, fast_mbufs / 16),   /* cache menor: pool maior, 16 lcores */
+        0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+    if (shared_fast_pool == NULL)
+        rte_exit(EXIT_FAILURE, "Falha ao criar fast pool compartilhado: %s\n",
+                 rte_strerror(rte_errno));
+
     uint16_t port;
     RTE_ETH_FOREACH_DEV(port) {
         if (port_init(port, nb_ports) != 0)
             rte_exit(EXIT_FAILURE, "Falha ao inicializar porta %u\n", port);
     }
 
-    /* MVP single core: datapath no core principal */
-    lcore_main(NULL);
+    /* Roda o datapath num worker lcore (CPU isolado pelo isolcpus=1-63), como
+     * o l2fwd faz. Lcore 0 (CPU 0) não é isolado e concorre com interrupções
+     * do kernel e com o master_thread do T-Rex (que também usa CPU 0 por
+     * padrão no trex_cfg.yaml) — isso pode corromper o timing do TX path. */
+    unsigned int worker_lcore = rte_get_next_lcore(-1, 1, 0);
+    if (worker_lcore >= RTE_MAX_LCORE)
+        rte_exit(EXIT_FAILURE,
+            "Nenhum worker lcore disponível — use -l 0-1 ou mais.\n");
+    printf("Datapath no lcore %u (CPU %u)\n",
+           worker_lcore, rte_lcore_to_cpu_id(worker_lcore));
+    rte_eal_remote_launch(lcore_main, NULL, worker_lcore);
+    rte_eal_mp_wait_lcore();
 
     print_stats();
 
