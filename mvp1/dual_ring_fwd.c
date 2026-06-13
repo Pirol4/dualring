@@ -170,23 +170,101 @@ sys_perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu,
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
+/* Lê o tipo numérico de uma PMU do sysfs (ex: /sys/.../amd_l3/type → 12). */
+static int
+sysfs_pmu_type(const char *pmu_name)
+{
+    char path[128];
+    snprintf(path, sizeof(path),
+             "/sys/bus/event_source/devices/%s/type", pmu_name);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int type = -1;
+    fscanf(f, "%d", &type);
+    fclose(f);
+    return type;
+}
+
+/* Lê o config de um evento de uma PMU do sysfs.
+ * Formato típico: "event=0x04,umask=0x08" → devolve (umask<<8)|event */
+static uint64_t
+sysfs_event_config(const char *pmu_name, const char *event_name)
+{
+    char path[192];
+    snprintf(path, sizeof(path),
+             "/sys/bus/event_source/devices/%s/events/%s", pmu_name, event_name);
+    FILE *f = fopen(path, "r");
+    if (!f) return UINT64_MAX;
+    char buf[128] = {0};
+    fgets(buf, sizeof(buf), f);
+    fclose(f);
+    unsigned long event = 0, umask = 0;
+    /* suporta "event=0xXX" e "event=0xXX,umask=0xXX" */
+    sscanf(buf, "event=%lx,umask=%lx", &event, &umask);
+    if (!event) sscanf(buf, "event=%lx", &event);
+    return event | (umask << 8);
+}
+
+/* Abre um fd de perf_event para cache LLC com cadeia de fallback:
+ *   1. PERF_TYPE_HW_CACHE / PERF_COUNT_HW_CACHE_LL  (Intel, genérico)
+ *   2. PMU "amd_l3" via sysfs (AMD Zen 2+)
+ *   3. PERF_TYPE_HARDWARE CACHE_MISSES/REFS           (proxy genérico)
+ *
+ * O AMD Zen 2 não expõe LLC via PERF_TYPE_HW_CACHE (retorna ENOENT);
+ * o L3 é uma PMU uncore separada ("amd_l3") acessível pelo sysfs. */
 static int
 open_llc_fd(uint32_t op, uint32_t result)
 {
     struct perf_event_attr pe = {
-        .type       = PERF_TYPE_HW_CACHE,
         .size       = sizeof(struct perf_event_attr),
-        /* config: [7:0]=cache, [15:8]=op, [23:16]=result */
-        .config     = (uint64_t)PERF_COUNT_HW_CACHE_LL |
-                      ((uint64_t)op     << 8)            |
-                      ((uint64_t)result << 16),
         .disabled   = 0,
         .exclude_hv = 1,
     };
-    int fd = (int)sys_perf_event_open(&pe, -1, g_worker_cpu, -1, 0);
-    if (fd < 0)
-        perror("[llc_monitor] perf_event_open");
-    return fd;
+    int fd;
+
+    /* ── Tentativa 1: HW_CACHE genérico (Intel, ARM, ...) ── */
+    pe.type   = PERF_TYPE_HW_CACHE;
+    pe.config = (uint64_t)PERF_COUNT_HW_CACHE_LL |
+                ((uint64_t)op     << 8)            |
+                ((uint64_t)result << 16);
+    fd = (int)sys_perf_event_open(&pe, -1, g_worker_cpu, -1, 0);
+    if (fd >= 0) return fd;
+
+    /* ── Tentativa 2: AMD L3 PMU via sysfs ── */
+    int amd_type = sysfs_pmu_type("amd_l3");
+    if (amd_type > 0) {
+        bool is_miss = (result == PERF_COUNT_HW_CACHE_RESULT_MISS);
+        uint64_t cfg = is_miss
+            ? sysfs_event_config("amd_l3", "l3_cache_miss_all")
+            : sysfs_event_config("amd_l3", "l3_cache_accesses_all");
+
+        if (cfg != UINT64_MAX) {
+            pe.type   = (uint32_t)amd_type;
+            pe.config = cfg;
+            /* AMD L3 é uncore: usar cpu=0 do socket, não o worker core */
+            fd = (int)sys_perf_event_open(&pe, -1, 0, -1, 0);
+            if (fd >= 0) {
+                printf("[llc_monitor] AMD L3 PMU: tipo=%d config=0x%lx\n",
+                       amd_type, (unsigned long)cfg);
+                return fd;
+            }
+        }
+    }
+
+    /* ── Tentativa 3: PERF_TYPE_HARDWARE genérico (proxy L2/LLC) ── */
+    pe.type   = PERF_TYPE_HARDWARE;
+    pe.config = (result == PERF_COUNT_HW_CACHE_RESULT_MISS)
+                    ? PERF_COUNT_HW_CACHE_MISSES
+                    : PERF_COUNT_HW_CACHE_REFS;
+    fd = (int)sys_perf_event_open(&pe, -1, g_worker_cpu, -1, 0);
+    if (fd >= 0) {
+        printf("[llc_monitor] Fallback PERF_TYPE_HARDWARE "
+               "(proxy L2/cache, não LLC específico)\n");
+        return fd;
+    }
+
+    perror("[llc_monitor] perf_event_open (todas as tentativas falharam)");
+    return -1;
 }
 
 static void *
