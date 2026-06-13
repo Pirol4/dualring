@@ -24,7 +24,12 @@
  *   3. drena o burst ring quando a pressão cede
  *
  * MVP 1 = particionamento ESTÁTICO (watermark fixo via CLI).
- * MVP 2/3 = watermark dinâmico guiado por LLC-load-misses (perf_event_open).
+ * MVP 2 = gatilho DINÂMICO por LLC-load-misses via perf_event_open:
+ *   Uma thread de monitor lê os contadores de hardware (PERF_TYPE_HW_CACHE /
+ *   PERF_COUNT_HW_CACHE_LL) no CPU do datapath a cada --monitor-ms ms e
+ *   calcula a taxa de misses = misses / loads. Quando a taxa ultrapassa
+ *   --miss-hi, ativa o burst path (g_llc_spill_active=1). Quando cai abaixo
+ *   de --miss-lo, volta ao fast path (histerese para evitar oscilação).
  *
  * Uso:
  *   dual_ring_fwd [EAL opts] -- [--fast-mbufs N] [--burst-mbufs N]
@@ -43,6 +48,11 @@
 #include <signal.h>
 #include <getopt.h>
 #include <stdbool.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -67,9 +77,20 @@ static unsigned int spill_watermark  = 256;    /* avail mínimo do fast pool   *
 static unsigned int stats_period_s   = 0;      /* -T: período de stats (0=off)*/
 static bool         force_spill      = false;  /* p/ teste: spill sempre      */
 
+/* ─── MVP2: configuração do monitor LLC ─────────────────────────────────── */
+
+static double        llc_hi_threshold = 0.05;  /* taxa de miss > 5%: ativa burst path   */
+static double        llc_lo_threshold = 0.02;  /* taxa de miss < 2%: volta ao fast path */
+static unsigned int  monitor_ms       = 100;    /* intervalo de polling do perf, em ms   */
+
 /* ─── Estado global ──────────────────────────────────────────────────────── */
 
-static volatile bool force_quit = false;
+static volatile bool     force_quit         = false;
+
+/* MVP2: estado do monitor LLC (escritos pela monitor thread, lidos pelo datapath) */
+static _Atomic uint32_t  g_llc_spill_active = 0;  /* 1 = burst path ativa       */
+static _Atomic uint32_t  g_llc_miss_ppm     = 0;  /* miss rate × 1e6 (p/ stats) */
+static int               g_worker_cpu       = -1; /* CPU do datapath             */
 
 /* Pool único compartilhado por todas as portas.
  * Com pools por porta, cada rte_eth_rx_queue_setup registra o MR apenas no
@@ -128,7 +149,94 @@ print_stats(void)
         printf("  drop_tx     : %12" PRIu64 "\n", s->drop_tx);
         printf("  fast_avail  : %12u  (de %u mbufs)\n", avail, fast_mbufs);
     }
+    /* MVP2: exibe estado do monitor LLC */
+    if (g_worker_cpu >= 0 && monitor_ms > 0) {
+        double miss_rate = atomic_load(&g_llc_miss_ppm) / 1e6;
+        printf("LLC miss rate : %8.4f%%  [%s]\n",
+               miss_rate * 100.0,
+               atomic_load(&g_llc_spill_active)
+                   ? "BURST PATH ativa (LLC sob pressão)"
+                   : "FAST PATH ativa");
+    }
     printf("══════════════════════════════════════════════════════════\n");
+}
+
+/* ─── MVP2: monitor de LLC via perf_event_open ───────────────────────────── */
+
+static long
+sys_perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu,
+                    int group_fd, unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+static int
+open_llc_fd(uint32_t op, uint32_t result)
+{
+    struct perf_event_attr pe = {
+        .type       = PERF_TYPE_HW_CACHE,
+        .size       = sizeof(struct perf_event_attr),
+        /* config: [7:0]=cache, [15:8]=op, [23:16]=result */
+        .config     = (uint64_t)PERF_COUNT_HW_CACHE_LL |
+                      ((uint64_t)op     << 8)            |
+                      ((uint64_t)result << 16),
+        .disabled   = 0,
+        .exclude_hv = 1,
+    };
+    int fd = (int)sys_perf_event_open(&pe, -1, g_worker_cpu, -1, 0);
+    if (fd < 0)
+        perror("[llc_monitor] perf_event_open");
+    return fd;
+}
+
+static void *
+llc_monitor_thread(__rte_unused void *arg)
+{
+    int fd_miss = open_llc_fd(PERF_COUNT_HW_CACHE_OP_READ,
+                               PERF_COUNT_HW_CACHE_RESULT_MISS);
+    int fd_load = open_llc_fd(PERF_COUNT_HW_CACHE_OP_READ,
+                               PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+
+    if (fd_miss < 0 || fd_load < 0) {
+        fprintf(stderr, "[llc_monitor] Falha ao abrir perf events "
+                "(precisa de root e kernel >= 3.4)\n");
+        if (fd_miss >= 0) close(fd_miss);
+        if (fd_load >= 0) close(fd_load);
+        return NULL;
+    }
+
+    printf("[llc_monitor] CPU %d: hi=%.0f%% lo=%.0f%% intervalo=%ums\n",
+           g_worker_cpu, llc_hi_threshold * 100.0,
+           llc_lo_threshold * 100.0, monitor_ms);
+
+    uint64_t prev_miss = 0, prev_load = 0;
+
+    while (!force_quit) {
+        usleep((unsigned)(monitor_ms * 1000U));
+
+        uint64_t cur_miss, cur_load;
+        if (read(fd_miss, &cur_miss, sizeof cur_miss) != (ssize_t)sizeof cur_miss ||
+            read(fd_load, &cur_load, sizeof cur_load) != (ssize_t)sizeof cur_load)
+            continue;
+
+        uint64_t d_miss = cur_miss - prev_miss;
+        uint64_t d_load = cur_load - prev_load;
+        prev_miss = cur_miss;
+        prev_load = cur_load;
+
+        double rate = (d_load > 0) ? (double)d_miss / (double)d_load : 0.0;
+        atomic_store(&g_llc_miss_ppm, (uint32_t)(rate * 1e6));
+
+        uint32_t active = atomic_load(&g_llc_spill_active);
+        if (!active && rate > llc_hi_threshold)
+            atomic_store(&g_llc_spill_active, 1);
+        else if (active && rate < llc_lo_threshold)
+            atomic_store(&g_llc_spill_active, 0);
+    }
+
+    close(fd_miss);
+    close(fd_load);
+    return NULL;
 }
 
 /* ─── Datapath ───────────────────────────────────────────────────────────── */
@@ -217,9 +325,10 @@ lcore_main(__rte_unused void *arg)
         stats_period_s ? (uint64_t)stats_period_s * rte_get_timer_hz() : 0;
 
     printf("Core %u: datapath iniciado (fast=%u mbufs, burst=%u mbufs, "
-           "watermark=%u%s)\n",
+           "watermark=%u%s%s)\n",
            rte_lcore_id(), fast_mbufs, burst_mbufs, spill_watermark,
-           force_spill ? ", FORCE-SPILL" : "");
+           force_spill ? ", FORCE-SPILL" : "",
+           (monitor_ms > 0 && g_worker_cpu >= 0) ? ", LLC-MONITOR" : "");
 
     while (!force_quit) {
         RTE_ETH_FOREACH_DEV(port) {
@@ -229,11 +338,16 @@ lcore_main(__rte_unused void *arg)
             if (nb > 0) {
                 g_stats[port].rx_total += nb;
 
-                /* Decisão fast vs spill: pressão no fast pool?            */
+                /* Decisão fast vs spill:
+                 *   force_spill           → sempre burst (debug / MVP1 test)
+                 *   g_llc_spill_active    → burst ativado pelo monitor LLC (MVP2)
+                 *   avail < watermark     → pool esgotando (fallback estático) */
                 unsigned int avail =
                     rte_mempool_avail_count(ctx->fast_pool);
                 bool under_pressure =
-                    force_spill || (avail < spill_watermark);
+                    force_spill                              ||
+                    atomic_load(&g_llc_spill_active)        ||
+                    (avail < spill_watermark);
 
                 if (unlikely(under_pressure)) {
                     spill_pkts(port, pkts, nb);
@@ -369,8 +483,12 @@ usage(const char *prog)
            "  --burst-ring N        capacidade do burst ring (padrão %u, pot. de 2)\n"
            "  --spill-watermark N   spill quando fast avail < N (padrão %u)\n"
            "  --force-spill         força o caminho de spill (teste)\n"
+           "  --miss-hi F           taxa LLC-miss para ativar burst path (padrão %.2f)\n"
+           "  --miss-lo F           taxa LLC-miss para voltar ao fast path (padrão %.2f)\n"
+           "  --monitor-ms N        intervalo do monitor LLC em ms (0=desligado, padrão %u)\n"
            "  -T N                  imprime stats a cada N segundos\n",
-           prog, fast_mbufs, burst_mbufs, burst_ring_size, spill_watermark);
+           prog, fast_mbufs, burst_mbufs, burst_ring_size, spill_watermark,
+           llc_hi_threshold, llc_lo_threshold, monitor_ms);
 }
 
 static int
@@ -382,18 +500,24 @@ parse_args(int argc, char **argv)
         { "burst-ring",      required_argument, NULL, 'r' },
         { "spill-watermark", required_argument, NULL, 'w' },
         { "force-spill",     no_argument,       NULL, 'F' },
+        { "miss-hi",         required_argument, NULL, 'H' },
+        { "miss-lo",         required_argument, NULL, 'L' },
+        { "monitor-ms",      required_argument, NULL, 'm' },
         { NULL, 0, NULL, 0 },
     };
     int opt;
 
     while ((opt = getopt_long(argc, argv, "T:h", opts, NULL)) != -1) {
         switch (opt) {
-        case 'f': fast_mbufs      = atoi(optarg); break;
-        case 'b': burst_mbufs     = atoi(optarg); break;
-        case 'r': burst_ring_size = atoi(optarg); break;
-        case 'w': spill_watermark = atoi(optarg); break;
-        case 'F': force_spill     = true;         break;
-        case 'T': stats_period_s  = atoi(optarg); break;
+        case 'f': fast_mbufs        = (unsigned)atoi(optarg);  break;
+        case 'b': burst_mbufs       = (unsigned)atoi(optarg);  break;
+        case 'r': burst_ring_size   = (unsigned)atoi(optarg);  break;
+        case 'w': spill_watermark   = (unsigned)atoi(optarg);  break;
+        case 'F': force_spill       = true;                     break;
+        case 'H': llc_hi_threshold  = atof(optarg);            break;
+        case 'L': llc_lo_threshold  = atof(optarg);            break;
+        case 'm': monitor_ms        = (unsigned)atoi(optarg);  break;
+        case 'T': stats_period_s    = (unsigned)atoi(optarg);  break;
         case 'h': usage(argv[0]); exit(0);
         default:  usage(argv[0]); return -1;
         }
@@ -449,8 +573,25 @@ main(int argc, char **argv)
     if (worker_lcore >= RTE_MAX_LCORE)
         rte_exit(EXIT_FAILURE,
             "Nenhum worker lcore disponível — use -l 0-1 ou mais.\n");
-    printf("Datapath no lcore %u (CPU %u)\n",
-           worker_lcore, rte_lcore_to_cpu_id(worker_lcore));
+    g_worker_cpu = (int)rte_lcore_to_cpu_id(worker_lcore);
+    printf("Datapath no lcore %u (CPU %d)\n", worker_lcore, g_worker_cpu);
+
+    /* MVP2: inicia monitor LLC na thread principal (lcore 0 / CPU 0).
+     * perf_event_open com cpu=g_worker_cpu mede os eventos *naquele* CPU,
+     * independente de qual thread faz a leitura. */
+    pthread_t monitor_tid;
+    bool monitor_running = false;
+    if (!force_spill && monitor_ms > 0) {
+        if (pthread_create(&monitor_tid, NULL, llc_monitor_thread, NULL) == 0) {
+            pthread_detach(monitor_tid);
+            monitor_running = true;
+        } else {
+            perror("pthread_create (llc_monitor)");
+        }
+    }
+    if (!monitor_running)
+        printf("[llc_monitor] Desligado (--monitor-ms 0 ou --force-spill)\n");
+
     rte_eal_remote_launch(lcore_main, NULL, worker_lcore);
     rte_eal_mp_wait_lcore();
 

@@ -8,7 +8,7 @@ SRC = dual_ring_fwd.c
 PKGCONF ?= pkg-config
 
 CFLAGS  += -O3 -g -Wall -Wextra $(shell $(PKGCONF) --cflags libdpdk)
-LDFLAGS += $(shell $(PKGCONF) --libs libdpdk)
+LDFLAGS += $(shell $(PKGCONF) --libs libdpdk) -lpthread
 
 all: $(APP)
 
