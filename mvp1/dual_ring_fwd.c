@@ -182,7 +182,7 @@ sysfs_pmu_type(const char *pmu_name)
     FILE *f = fopen(path, "r");
     if (!f) return -1;
     int type = -1;
-    fscanf(f, "%d", &type);
+    (void)fscanf(f, "%d", &type);
     fclose(f);
     return type;
 }
@@ -198,7 +198,7 @@ sysfs_event_config(const char *pmu_name, const char *event_name)
     FILE *f = fopen(path, "r");
     if (!f) return UINT64_MAX;
     char buf[128] = {0};
-    fgets(buf, sizeof(buf), f);
+    (void)fgets(buf, sizeof(buf), f);
     fclose(f);
     unsigned long event = 0, umask = 0;
     /* suporta "event=0xXX" e "event=0xXX,umask=0xXX" */
@@ -263,7 +263,7 @@ open_llc_fd(uint32_t op, uint32_t result)
     pe.type   = PERF_TYPE_HARDWARE;
     pe.config = (result == PERF_COUNT_HW_CACHE_RESULT_MISS)
                     ? PERF_COUNT_HW_CACHE_MISSES
-                    : PERF_COUNT_HW_CACHE_REFS;
+                    : PERF_COUNT_HW_CACHE_REFERENCES;
     fd = (int)sys_perf_event_open(&pe, -1, g_worker_cpu, -1, 0);
     if (fd >= 0) {
         printf("[llc_monitor] Fallback PERF_TYPE_HARDWARE "
