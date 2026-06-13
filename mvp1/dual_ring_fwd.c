@@ -238,25 +238,35 @@ open_llc_fd(uint32_t op, uint32_t result)
     fprintf(stderr, "[llc_monitor] HW_CACHE/LL falhou (errno=%d %s), tentando AMD L3...\n",
             errno, strerror(errno));
 
-    /* ── Tentativa 2: AMD L3 PMU via sysfs ── */
+    /* ── Tentativa 2: AMD L3 PMU (uncore, socket-wide) ── */
     int amd_type = sysfs_pmu_type("amd_l3");
     if (amd_type > 0) {
         bool is_miss = (result == PERF_COUNT_HW_CACHE_RESULT_MISS);
+
+        /* 2a: nomes de eventos via sysfs (kernel >= 5.11 com JSON AMD L3) */
         uint64_t cfg = is_miss
             ? sysfs_event_config("amd_l3", "l3_cache_miss_all")
             : sysfs_event_config("amd_l3", "l3_cache_accesses_all");
 
-        if (cfg != UINT64_MAX) {
-            pe.type   = (uint32_t)amd_type;
-            pe.config = cfg;
-            /* AMD L3 é uncore: usar cpu=0 do socket, não o worker core */
-            fd = (int)sys_perf_event_open(&pe, -1, 0, -1, 0);
-            if (fd >= 0) {
-                printf("[llc_monitor] AMD L3 PMU: tipo=%d config=0x%lx\n",
-                       amd_type, (unsigned long)cfg);
-                return fd;
-            }
+        if (cfg == UINT64_MAX) {
+            /* 2b: raw event codes Zen 2 (kernel 5.4 — events/ vazio)
+             *     config[7:0]=EventSelect, config[15:8]=UnitMask
+             *     0x06/0xFF = ChL3Miss (miss em todos os acessos)
+             *     0x04/0xFF = ChL3Req  (todos os requests à L3)
+             *     Validado: perf stat -C 1 -e amd_l3/event=0x6,umask=0xff/ retorna contagens reais */
+            cfg = is_miss ? 0xFF06ULL : 0xFF04ULL;
         }
+
+        pe.type   = (uint32_t)amd_type;
+        pe.config = cfg;
+        fd = (int)sys_perf_event_open(&pe, -1, 0, -1, 0);
+        if (fd >= 0) {
+            printf("[llc_monitor] AMD L3 PMU: tipo=%d config=0x%lx\n",
+                   amd_type, (unsigned long)cfg);
+            return fd;
+        }
+        fprintf(stderr, "[llc_monitor] AMD L3 PMU falhou (errno=%d %s)\n",
+                errno, strerror(errno));
     }
 
     /* ── Tentativa 3: PERF_TYPE_HARDWARE genérico (proxy L2/LLC) ── */
