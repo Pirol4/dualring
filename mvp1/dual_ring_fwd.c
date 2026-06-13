@@ -81,9 +81,9 @@ static bool         force_spill      = false;  /* p/ teste: spill sempre      */
 
 /* ─── MVP2: configuração do monitor LLC ─────────────────────────────────── */
 
-static double        llc_hi_threshold = 0.05;  /* taxa de miss > 5%: ativa burst path   */
-static double        llc_lo_threshold = 0.02;  /* taxa de miss < 2%: volta ao fast path */
-static unsigned int  monitor_ms       = 100;    /* intervalo de polling do perf, em ms   */
+static double        llc_hi_threshold = 0.50;  /* taxa de miss > 50%: ativa burst path  */
+static double        llc_lo_threshold = 0.30;  /* taxa de miss < 30%: volta ao fast path*/
+static unsigned int  monitor_ms       = 1000;   /* janela de 1s: ~26 acessos/janela AMD  */
 
 /* ─── Estado global ──────────────────────────────────────────────────────── */
 
@@ -254,12 +254,18 @@ open_llc_fd(uint32_t op, uint32_t result)
              *     0x06/0xFF = ChL3Miss (miss em todos os acessos)
              *     0x04/0xFF = ChL3Req  (todos os requests à L3)
              *     Validado: perf stat -C 1 -e amd_l3/event=0x6,umask=0xff/ retorna contagens reais */
-            cfg = is_miss ? 0xFF06ULL : 0xFF04ULL;
+            /* Zen 2: event=0x06, umask=0x10 = data read miss; umask=0x08 = data read request
+             * Validado: idle→0% miss, tráfego@13Mpps→76% miss (perf stat -C1 -e amd_l3/...) */
+            cfg = is_miss ? 0x1006ULL : 0x0806ULL;
         }
 
-        pe.type   = (uint32_t)amd_type;
-        pe.config = cfg;
-        fd = (int)sys_perf_event_open(&pe, -1, 0, -1, 0);
+        /* PMUs uncore não suportam exclude_hv — usar struct limpa */
+        struct perf_event_attr pe_uncore = {
+            .size   = sizeof(struct perf_event_attr),
+            .type   = (uint32_t)amd_type,
+            .config = cfg,
+        };
+        fd = (int)sys_perf_event_open(&pe_uncore, -1, 0, -1, 0);
         if (fd >= 0) {
             printf("[llc_monitor] AMD L3 PMU: tipo=%d config=0x%lx\n",
                    amd_type, (unsigned long)cfg);
