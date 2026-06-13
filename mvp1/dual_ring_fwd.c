@@ -51,6 +51,8 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 
@@ -222,13 +224,19 @@ open_llc_fd(uint32_t op, uint32_t result)
     };
     int fd;
 
-    /* ── Tentativa 1: HW_CACHE genérico (Intel, ARM, ...) ── */
+    /* ── Tentativa 1: HW_CACHE genérico (Intel/AMD com suporte de kernel) ── */
     pe.type   = PERF_TYPE_HW_CACHE;
     pe.config = (uint64_t)PERF_COUNT_HW_CACHE_LL |
                 ((uint64_t)op     << 8)            |
                 ((uint64_t)result << 16);
     fd = (int)sys_perf_event_open(&pe, -1, g_worker_cpu, -1, 0);
-    if (fd >= 0) return fd;
+    if (fd >= 0) {
+        printf("[llc_monitor] PERF_TYPE_HW_CACHE/LL: cpu=%d config=0x%lx\n",
+               g_worker_cpu, (unsigned long)pe.config);
+        return fd;
+    }
+    fprintf(stderr, "[llc_monitor] HW_CACHE/LL falhou (errno=%d %s), tentando AMD L3...\n",
+            errno, strerror(errno));
 
     /* ── Tentativa 2: AMD L3 PMU via sysfs ── */
     int amd_type = sysfs_pmu_type("amd_l3");
