@@ -70,7 +70,6 @@
 #define BURST_TX_DRAIN_US   100     /* drain TX a cada ~100 µs (idêntico l2fwd) */
 #define MEMPOOL_CACHE_SIZE  256
 #define MAX_RX_QUEUE_PER_LCORE 16
-#define RX_RING_SIZE        1024
 #define TX_RING_SIZE        1024
 
 /* Verificação de link */
@@ -93,6 +92,7 @@ static int      timer_period             = 10;  /* segundos; 0 = off */
 static unsigned nb_fast_mbufs    = 4096;   /* fill ring pequeno (LLC)   */
 static unsigned nb_burst_mbufs   = 65536;  /* overflow pool (DRAM)      */
 static unsigned spill_watermark  = 256;    /* threshold do fill ring     */
+static uint16_t rx_ring_size     = 1024;   /* descritores RX da NIC     */
 
 /* ── Estado global ────────────────────────────────────────────────────────── */
 
@@ -368,22 +368,26 @@ l2fwd_main_loop(void)
             /* ── Decisão do caminho (gatilho: fill ring pressure) ──────── */
             unsigned fast_avail = rte_mempool_avail_count(fast_pool);
 
+            /*
+             * Drena o burst ring independente do caminho: sem isso, o burst
+             * ring enche e o burst_pool esgota quando ficamos presos no spill
+             * path por múltiplos ciclos consecutivos.
+             */
+            dr_drain_burst_ring(portid, qconf);
+
             if (unlikely(fast_avail < spill_watermark)) {
                 /*
                  * SPILL PATH: fill ring sob pressão.
-                 * Copia para burst_pool e libera fast mbufs imediatamente.
-                 * Sem TX direto: evita esgotar ainda mais o fill ring.
+                 * Copia para burst_pool e libera fast mbufs imediatamente;
+                 * o drain acima já abriu espaço no burst ring e burst_pool.
                  */
                 dr_spill_pkts(pkts_burst, (uint16_t)nb_rx, portid);
             } else {
                 /*
                  * FAST PATH: fill ring saudável.
-                 * Forward direto (igual l2fwd) + drena burst ring pendente.
+                 * Forward direto (igual l2fwd).
                  */
-                dr_drain_burst_ring(portid, qconf);
-
                 for (j = 0; j < nb_rx; j++) {
-                    /* prefetch do próximo pacote enquanto processa o atual */
                     if (j + 1 < nb_rx)
                         rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + 1],
                                                         void *));
@@ -439,15 +443,17 @@ check_all_ports_link_status(uint32_t port_mask)
             if (link.link_status == RTE_ETH_LINK_DOWN)
                 all_up = 0;
         }
+        if (print_flag) {
+            printf("\n");
+            break;
+        }
         if (!all_up) {
             printf(".");
             fflush(stdout);
             rte_delay_ms(CHECK_INTERVAL_MS);
         }
-        if (all_up || count == MAX_CHECK_TIME) {
+        if (all_up || count == (MAX_CHECK_TIME - 1))
             print_flag = 1;
-            printf("\n");
-        }
     }
 }
 
@@ -459,7 +465,7 @@ l2fwd_port_init(uint16_t portid)
     struct rte_eth_conf     local_conf = port_conf;
     struct rte_eth_dev_info dev_info;
     struct rte_eth_txconf   txconf;
-    uint16_t nb_rxd = RX_RING_SIZE, nb_txd = TX_RING_SIZE;
+    uint16_t nb_rxd = rx_ring_size, nb_txd = TX_RING_SIZE;
     int ret;
 
     if (!rte_eth_dev_is_valid_port(portid))
@@ -536,8 +542,10 @@ usage(const char *prgname)
         "  --fast-mbufs N       tamanho do fill ring/fast pool (padrão %u)\n"
         "  --burst-mbufs N      tamanho do burst pool/DRAM (padrão %u)\n"
         "  --spill-watermark N  threshold: spill quando fast_avail < N "
-        "(padrão %u)\n",
-        prgname, timer_period, nb_fast_mbufs, nb_burst_mbufs, spill_watermark);
+        "(padrão %u)\n"
+        "  --rx-ring-size N     descritores RX da NIC (padrão %u; pot-de-2)\n",
+        prgname, timer_period, nb_fast_mbufs, nb_burst_mbufs, spill_watermark,
+        rx_ring_size);
 }
 
 static uint32_t
@@ -558,6 +566,7 @@ l2fwd_parse_args(int argc, char **argv)
         { "fast-mbufs",       required_argument, NULL, 0 },
         { "burst-mbufs",      required_argument, NULL, 0 },
         { "spill-watermark",  required_argument, NULL, 0 },
+        { "rx-ring-size",     required_argument, NULL, 0 },
         { NULL, 0, NULL, 0 },
     };
     int opt, option_index;
@@ -596,6 +605,8 @@ l2fwd_parse_args(int argc, char **argv)
                 nb_burst_mbufs = (unsigned)atoi(optarg);
             else if (!strcmp(lgopts[option_index].name, "spill-watermark"))
                 spill_watermark = (unsigned)atoi(optarg);
+            else if (!strcmp(lgopts[option_index].name, "rx-ring-size"))
+                rx_ring_size = (uint16_t)atoi(optarg);
             break;
 
         default:
@@ -642,6 +653,7 @@ main(int argc, char **argv)
     printf("fast-mbufs     : %u\n", nb_fast_mbufs);
     printf("burst-mbufs    : %u\n", nb_burst_mbufs);
     printf("spill-watermark: %u\n", spill_watermark);
+    printf("rx-ring-size   : %u\n", rx_ring_size);
 
     if (timer_period > 0)
         timer_period_tsc = (uint64_t)timer_period * rte_get_tsc_hz();
@@ -673,16 +685,16 @@ main(int argc, char **argv)
         l2fwd_dst_ports[last_port] = last_port;
     }
 
-    /* Distribui portas entre lcores (idêntico l2fwd) */
+    /* Distribui portas entre lcores: 1 porta por lcore, idêntico ao l2fwd padrão */
     rx_lcore_id = 0;
     RTE_ETH_FOREACH_DEV(portid) {
         if ((l2fwd_enabled_port_mask & (1u << portid)) == 0) {
             printf("Ignorando porta %u\n", portid);
             continue;
         }
+        /* Avança para o próximo lcore habilitado que ainda não tem porta */
         while (rte_lcore_is_enabled(rx_lcore_id) == 0 ||
-               lcore_queue_conf[rx_lcore_id].n_rx_port ==
-               MAX_RX_QUEUE_PER_LCORE) {
+               lcore_queue_conf[rx_lcore_id].n_rx_port == 1) {
             rx_lcore_id++;
             if (rx_lcore_id >= RTE_MAX_LCORE)
                 rte_exit(EXIT_FAILURE, "lcores insuficientes para as portas\n");
@@ -703,7 +715,7 @@ main(int argc, char **argv)
     /* ── DR: cria fast pool (fill ring, LLC-residente) ───────────────────── */
     {
         /* Garante mbufs suficientes: nb_rxd × nb_ports + caches + burst */
-        unsigned min_fast = nb_ports_available * RX_RING_SIZE
+        unsigned min_fast = nb_ports_available * rx_ring_size
                             + nb_lcores * MEMPOOL_CACHE_SIZE
                             + MAX_PKT_BURST * 4;
         if (nb_fast_mbufs < min_fast) {
