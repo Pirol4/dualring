@@ -93,6 +93,12 @@ static unsigned nb_fast_mbufs    = 4096;   /* fill ring pequeno (LLC)   */
 static unsigned nb_burst_mbufs   = 65536;  /* overflow pool (DRAM)      */
 static unsigned spill_watermark  = 256;    /* threshold do fill ring     */
 static uint16_t rx_ring_size     = 1024;   /* descritores RX da NIC     */
+static bool     disable_burst    = false;  /* --disable-burst: só fast pool (small privRing) */
+
+/* DR: simulação de workload (réplica do WorkPackage do ShRing/FastClick) */
+static uint8_t  *work_buf        = NULL;
+static uint64_t  work_buf_sz     = 0;     /* bytes; 0 = desabilitado     */
+static unsigned  work_per_pkt    = 0;     /* acessos aleatórios por pkt  */
 
 /* ── Estado global ────────────────────────────────────────────────────────── */
 
@@ -134,9 +140,12 @@ struct l2fwd_port_statistics {
     uint64_t rx;
     uint64_t dropped;
     /* DR: contadores adicionais */
-    uint64_t spilled;     /* fast→burst ring                */
-    uint64_t drained;     /* burst ring→TX                  */
-    uint64_t drop_spill;  /* descartados no spill           */
+    uint64_t spilled;       /* fast→burst ring                */
+    uint64_t drained;       /* burst ring→TX                  */
+    uint64_t drop_spill;    /* descartados no spill           */
+    /* Medição de desempenho: ciclos por pacote (rdtsc) */
+    uint64_t cycles_total;  /* soma de ciclos gastos no RX path */
+    uint64_t cycles_count;  /* pacotes processados             */
 } __rte_cache_aligned;
 
 static struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
@@ -181,6 +190,10 @@ print_stats(void)
         unsigned fast_avail = fast_pool ?
             rte_mempool_avail_count(fast_pool) : 0;
 
+        uint64_t ctotal = port_statistics[portid].cycles_total;
+        uint64_t ccount = port_statistics[portid].cycles_count;
+        uint64_t cpkt   = (ccount > 0) ? (ctotal / ccount) : 0;
+
         printf("\n Porta %u ────────────────────────────────────────\n", portid);
         printf("  rx          : %16" PRIu64 "\n", port_statistics[portid].rx);
         printf("  tx          : %16" PRIu64 "\n", port_statistics[portid].tx);
@@ -193,6 +206,10 @@ print_stats(void)
                port_statistics[portid].drop_spill);
         printf("  [DR] fast_avail : %12u  (de %u mbufs)\n",
                fast_avail, nb_fast_mbufs);
+        printf("  [DR] cycles/pkt : %12" PRIu64 "  (%.1f Mpps@%.0fGHz)\n",
+               cpkt,
+               cpkt > 0 ? (rte_get_tsc_hz() / 1e6 / cpkt) : 0.0,
+               rte_get_tsc_hz() / 1e9);
 
         total_rx         += port_statistics[portid].rx;
         total_tx         += port_statistics[portid].tx;
@@ -210,6 +227,25 @@ print_stats(void)
     printf("  [DR] drained    : %12" PRIu64 "\n", total_drained);
     printf("  [DR] drop_spill : %12" PRIu64 "\n", total_drop_spill);
     printf("═════════════════════════════════════════════════════\n");
+}
+
+/* ── Simulação de workload (WorkPackage — réplica do ShRing/FastClick) ────── */
+
+/* Faz 'work_per_pkt' acessos aleatórios a 'work_buf' de tamanho 'work_buf_sz'.
+ * Simula processamento com footprint de memória configurável, como NAT/firewall.
+ * A semente varia por pacote para evitar prefetch especulativo do HW. */
+static inline void
+do_work(struct rte_mbuf *pkt)
+{
+    if (likely(work_per_pkt == 0 || work_buf == NULL))
+        return;
+    uint32_t seed = rte_be_to_cpu_32(
+        *rte_pktmbuf_mtod_offset(pkt, uint32_t *, offsetof(struct rte_ether_hdr, src_addr)));
+    for (unsigned k = 0; k < work_per_pkt; k++) {
+        seed = seed * 1664525u + 1013904223u;  /* LCG — distribui uniformemente */
+        volatile uint8_t *p = work_buf + (seed % work_buf_sz);
+        (void)*p;
+    }
 }
 
 /* ── MAC update (idêntico l2fwd) ─────────────────────────────────────────── */
@@ -234,6 +270,8 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid,
                      struct lcore_queue_conf *qconf)
 {
     unsigned dst_port = l2fwd_dst_ports[portid];
+
+    do_work(m);   /* simulação de workload (NOP se work_per_pkt == 0) */
 
     if (mac_updating)
         l2fwd_mac_updating(m, dst_port);
@@ -365,27 +403,13 @@ l2fwd_main_loop(void)
 
             port_statistics[portid].rx += nb_rx;
 
-            /* ── Decisão do caminho (gatilho: fill ring pressure) ──────── */
-            unsigned fast_avail = rte_mempool_avail_count(fast_pool);
+            uint64_t t0 = rte_rdtsc();
 
-            /*
-             * Drena o burst ring independente do caminho: sem isso, o burst
-             * ring enche e o burst_pool esgota quando ficamos presos no spill
-             * path por múltiplos ciclos consecutivos.
-             */
-            dr_drain_burst_ring(portid, qconf);
-
-            if (unlikely(fast_avail < spill_watermark)) {
+            if (disable_burst) {
                 /*
-                 * SPILL PATH: fill ring sob pressão.
-                 * Copia para burst_pool e libera fast mbufs imediatamente;
-                 * o drain acima já abriu espaço no burst ring e burst_pool.
-                 */
-                dr_spill_pkts(pkts_burst, (uint16_t)nb_rx, portid);
-            } else {
-                /*
-                 * FAST PATH: fill ring saudável.
-                 * Forward direto (igual l2fwd).
+                 * MODO SMALL PRIVRING (baseline de comparação):
+                 * Apenas fast_pool, sem burst ring. Equivale ao "small privRing"
+                 * do ShRing paper — eficiente em LLC mas dropa sob burst.
                  */
                 for (j = 0; j < nb_rx; j++) {
                     if (j + 1 < nb_rx)
@@ -393,7 +417,41 @@ l2fwd_main_loop(void)
                                                         void *));
                     l2fwd_simple_forward(pkts_burst[j], portid, qconf);
                 }
+            } else {
+                /* ── Decisão do caminho (gatilho: fill ring pressure) ──── */
+                unsigned fast_avail = rte_mempool_avail_count(fast_pool);
+
+                /*
+                 * Drena o burst ring independente do caminho: sem isso, o burst
+                 * ring enche e o burst_pool esgota quando ficamos presos no
+                 * spill path por múltiplos ciclos consecutivos.
+                 */
+                dr_drain_burst_ring(portid, qconf);
+
+                if (unlikely(fast_avail < spill_watermark)) {
+                    /*
+                     * SPILL PATH: fill ring sob pressão.
+                     * Copia para burst_pool e libera fast mbufs imediatamente;
+                     * o drain acima já abriu espaço no burst ring e burst_pool.
+                     */
+                    dr_spill_pkts(pkts_burst, (uint16_t)nb_rx, portid);
+                } else {
+                    /*
+                     * FAST PATH: fill ring saudável.
+                     * Forward direto (igual l2fwd).
+                     */
+                    for (j = 0; j < nb_rx; j++) {
+                        if (j + 1 < nb_rx)
+                            rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + 1],
+                                                            void *));
+                        l2fwd_simple_forward(pkts_burst[j], portid, qconf);
+                    }
+                }
             }
+
+            uint64_t t1 = rte_rdtsc();
+            port_statistics[portid].cycles_total += (t1 - t0);
+            port_statistics[portid].cycles_count += nb_rx;
         }
     }
 }
@@ -543,7 +601,12 @@ usage(const char *prgname)
         "  --burst-mbufs N      tamanho do burst pool/DRAM (padrão %u)\n"
         "  --spill-watermark N  threshold: spill quando fast_avail < N "
         "(padrão %u)\n"
-        "  --rx-ring-size N     descritores RX da NIC (padrão %u; pot-de-2)\n",
+        "  --rx-ring-size N     descritores RX da NIC (padrão %u; pot-de-2)\n"
+        "  --disable-burst      desabilita burst ring (modo small privRing)\n"
+        "\n"
+        "  Workload (WorkPackage, réplica do ShRing):\n"
+        "  --work-mem-mb M      tamanho do buffer de trabalho em MiB (padrão: 0=off)\n"
+        "  --work-per-pkt N     acessos aleatórios ao buffer por pacote (padrão: 0)\n",
         prgname, timer_period, nb_fast_mbufs, nb_burst_mbufs, spill_watermark,
         rx_ring_size);
 }
@@ -567,6 +630,9 @@ l2fwd_parse_args(int argc, char **argv)
         { "burst-mbufs",      required_argument, NULL, 0 },
         { "spill-watermark",  required_argument, NULL, 0 },
         { "rx-ring-size",     required_argument, NULL, 0 },
+        { "disable-burst",    no_argument,       NULL, 0 },
+        { "work-mem-mb",      required_argument, NULL, 0 },
+        { "work-per-pkt",     required_argument, NULL, 0 },
         { NULL, 0, NULL, 0 },
     };
     int opt, option_index;
@@ -607,6 +673,12 @@ l2fwd_parse_args(int argc, char **argv)
                 spill_watermark = (unsigned)atoi(optarg);
             else if (!strcmp(lgopts[option_index].name, "rx-ring-size"))
                 rx_ring_size = (uint16_t)atoi(optarg);
+            else if (!strcmp(lgopts[option_index].name, "disable-burst"))
+                disable_burst = true;
+            else if (!strcmp(lgopts[option_index].name, "work-mem-mb"))
+                work_buf_sz = (uint64_t)atoi(optarg) * 1024 * 1024;
+            else if (!strcmp(lgopts[option_index].name, "work-per-pkt"))
+                work_per_pkt = (unsigned)atoi(optarg);
             break;
 
         default:
@@ -651,9 +723,13 @@ main(int argc, char **argv)
     printf("MAC updating   : %s\n", mac_updating ? "sim" : "não");
     printf("Stats timer    : %d s\n", timer_period);
     printf("fast-mbufs     : %u\n", nb_fast_mbufs);
-    printf("burst-mbufs    : %u\n", nb_burst_mbufs);
+    printf("burst-mbufs    : %u%s\n", nb_burst_mbufs,
+           disable_burst ? " (DESABILITADO -- small privRing)" : "");
     printf("spill-watermark: %u\n", spill_watermark);
     printf("rx-ring-size   : %u\n", rx_ring_size);
+    printf("disable-burst  : %s\n", disable_burst ? "sim" : "não");
+    printf("work-mem-mb    : %u MiB\n", (unsigned)(work_buf_sz >> 20));
+    printf("work-per-pkt   : %u\n", work_per_pkt);
 
     if (timer_period > 0)
         timer_period_tsc = (uint64_t)timer_period * rte_get_tsc_hz();
@@ -735,8 +811,8 @@ main(int argc, char **argv)
                (double)nb_fast_mbufs * RTE_MBUF_DEFAULT_BUF_SIZE / (1<<20));
     }
 
-    /* ── DR: cria burst pool (overflow, DRAM) ────────────────────────────── */
-    {
+    /* ── DR: cria burst pool (overflow, DRAM) — apenas se não --disable-burst */
+    if (!disable_burst) {
         unsigned cache = RTE_MIN((unsigned)MEMPOOL_CACHE_SIZE,
                                   nb_burst_mbufs / 8);
         burst_pool = rte_pktmbuf_pool_create(
@@ -747,20 +823,39 @@ main(int argc, char **argv)
                      rte_strerror(rte_errno));
         printf("burst_pool: %u mbufs (~%.1f MiB)\n", nb_burst_mbufs,
                (double)nb_burst_mbufs * RTE_MBUF_DEFAULT_BUF_SIZE / (1<<20));
+    } else {
+        printf("burst_pool: DESABILITADO (small privRing mode)\n");
     }
 
     /* ── DR: cria burst rings por porta de ingresso ──────────────────────── */
-    RTE_ETH_FOREACH_DEV(portid) {
-        if ((l2fwd_enabled_port_mask & (1u << portid)) == 0)
-            continue;
-        char name[32];
-        snprintf(name, sizeof(name), "burst_ring_%u", portid);
-        dr_burst_ring[portid] = rte_ring_create(name, DR_BURST_RING_ENTRIES,
-                                                  rte_socket_id(),
-                                                  RING_F_SP_ENQ | RING_F_SC_DEQ);
-        if (dr_burst_ring[portid] == NULL)
-            rte_exit(EXIT_FAILURE, "Falha ao criar burst_ring porta %u: %s\n",
-                     portid, rte_strerror(rte_errno));
+    if (!disable_burst) {
+        RTE_ETH_FOREACH_DEV(portid) {
+            if ((l2fwd_enabled_port_mask & (1u << portid)) == 0)
+                continue;
+            char name[32];
+            snprintf(name, sizeof(name), "burst_ring_%u", portid);
+            dr_burst_ring[portid] = rte_ring_create(name, DR_BURST_RING_ENTRIES,
+                                                      rte_socket_id(),
+                                                      RING_F_SP_ENQ | RING_F_SC_DEQ);
+            if (dr_burst_ring[portid] == NULL)
+                rte_exit(EXIT_FAILURE, "Falha ao criar burst_ring porta %u: %s\n",
+                         portid, rte_strerror(rte_errno));
+        }
+    }
+
+    /* ── Work buffer (WorkPackage): alocado em hugepages para reproduzir
+     *    footprint de memória de NFs reais (ShRing Fig. 8) ─────────────────── */
+    if (work_per_pkt > 0 && work_buf_sz > 0) {
+        work_buf = (uint8_t *)rte_malloc("work_buf", work_buf_sz,
+                                          RTE_CACHE_LINE_SIZE);
+        if (work_buf == NULL)
+            rte_exit(EXIT_FAILURE, "Falha ao alocar work_buf (%zu MiB)\n",
+                     (size_t)(work_buf_sz >> 20));
+        /* Toca cada página para garantir alocação física antes dos experimentos */
+        for (uint64_t k = 0; k < work_buf_sz; k += 4096)
+            work_buf[k] = (uint8_t)k;
+        printf("work_buf  : %.0f MiB em hugepages, %u acessos/pkt\n",
+               (double)work_buf_sz / (1 << 20), work_per_pkt);
     }
 
     /* ── Inicialização das portas ─────────────────────────────────────────── */
