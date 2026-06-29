@@ -1,6 +1,6 @@
 # DualRing — Alocação Dinâmica de Buffers na LLC sobre DPDK
 
-TCC de Mestrado (PPGCC/UFMG) — implementação de um sistema de anéis duplos de
+Implementação de um sistema de anéis duplos de
 recepção que elimina o trade-off entre absorção de micro-bursts e eficiência de
 cache em redes de alta velocidade.
 
