@@ -1,0 +1,8 @@
+impl=l2fwd
+exp_id=750
+start=2026-06-19T12:37:43-06:00
+duration_s=800
+perf_interval_ms=5000
+kernel=5.4.0-212-generic
+cpu=AMD EPYC 7452 32-Core Processor
+cores_monitored=1-15

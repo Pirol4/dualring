@@ -1,0 +1,8 @@
+
+=== RESULTADO ===
+TX total : 267857183
+RX total : 267694814
+Perda    : 162369 (0.0606%)
+  porta 0: tx=267857183 rx=185
+  porta 1: tx=61 rx=267694814
+JSON_STATS: {"tx": 267857183, "rx": 267694814, "loss": 162369, "loss_pct": 0.06061775091541973, "ports": {"0": {"tx": 267857183, "rx": 185}, "1": {"tx": 61, "rx": 267694814}}, "latency": {"global": {"old_flow": 0, "bad_hdr": 0}, "11": {"err_cntrs": {"dropped": 37, "out_of_order": 0, "dup": 0, "seq_too_high": 30, "seq_too_low": 0}, "latency": {"jitter": 3, "average": 18.0, "total_max": 32, "total_min": 8, "last_max": 32, "histogram": {"0": 894, "10": 30516, "20": 27103, "2000": 1, "30": 2325, "40": 4, "50": 1, "500": 2}}}}}
