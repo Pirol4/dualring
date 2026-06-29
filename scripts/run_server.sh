@@ -1,29 +1,41 @@
 #!/bin/bash
-# scripts/run_server.sh — Inicia a implementação DPDK no servidor DUT
+# scripts/run_server.sh — Inicia a implementação DPDK no servidor DUT (TCC DualRing)
 #
 # Uso:
 #   sudo ./scripts/run_server.sh <impl> [duration_s]
 #
-#   impl:
-#     l2fwd            — l2fwd padrão DPDK (privRing grande — baseline)
-#     l2fwd_dr_priv    — l2fwd_dr emulando privRing grande (--disable-burst)
-#     l2fwd_dr_small   — l2fwd_dr emulando small privRing  (--disable-burst, ring pequeno)
-#     l2fwd_dr_dual    — DualRing (ring pequeno + burst ring, work sim ativado)
-#     l2fwd_dr_dual_nw — DualRing sem work simulation (só ring)
-#     shring           — ShRing (DPDK 21.05 fork, deve estar em ~/shring-dpdk/build)
+#   impl (as DUAS configurações da avaliação principal):
+#     privring   — método clássico: anel único pequeno, sem transbordo
+#                  (l2fwd_dr --disable-burst). Encaminha tudo inline.
+#     dualring   — DualRing: anel rápido pequeno + transbordo em DRAM.
 #
-#   duration_s:
-#     Segundos para manter o app vivo (default: 750 — cobre 5 reps × 2 perfis)
+#   impl (variantes opcionais p/ análise complementar):
+#     privring_big — privRing com anel grande (1024): absorve rajada, MAS
+#                    sofre o Leaky DMA (outliers de latência, ver relatório).
+#     l2fwd        — exemplo l2fwd padrão do DPDK (referência externa).
 #
-# Fluxo esperado:
-#   Terminal 1 (DUT):     sudo ./scripts/run_server.sh l2fwd_dr_dual 750 | tee /tmp/server.log
-#   Terminal 2 (DUT):     sudo ./scripts/collect_server.sh l2fwd_dr_dual $EXP_ID 750
-#   Servidor T-Rex:       ./collect_client.sh l2fwd_dr_dual $EXP_ID
+#   duration_s: segundos mantendo o app vivo (default: 750).
+#
+# COMPARAÇÃO JUSTA (privring vs dualring)
+#   Ambos usam o MESMO binário (l2fwd_dr), o MESMO anel rápido pequeno
+#   (--rx-ring-size 128) e a MESMA carga por pacote (--work-per-pkt/--work-mem-mb).
+#   A ÚNICA diferença é o mecanismo de transbordo. Assim, qualquer diferença de
+#   perda/latência é atribuível ao DualRing, e não a configuração de anel/PMD.
+#
+#   Por que o anel pequeno em AMBOS: o relatório já mostra que um anel grande
+#   evita descarte mas POLUI a LLC (4049 outliers ≥1 ms). O privring pequeno
+#   isola o efeito do transbordo; o privring_big (opcional) mostra o outro chifre
+#   do trade-off. O DualRing vence os dois: baixa perda E baixa cauda.
+#
+# Fluxo:
+#   Terminal 1 (DUT): sudo ./scripts/run_server.sh dualring 750 | tee /tmp/server.log
+#   Terminal 2 (DUT): sudo ./scripts/collect_server.sh dualring $EXP_ID 750
+#   Servidor T-Rex:   ./collect_client.sh dualring $EXP_ID
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
-IMPL="${1:?Uso: sudo $0 <impl> [duration_s]}"
+IMPL="${1:?Uso: sudo $0 <privring|dualring|privring_big|l2fwd> [duration_s]}"
 DURATION="${2:-750}"
 
 NIC0="0000:41:00.0"
@@ -34,19 +46,20 @@ APP_ARGS="-p 0x3 -T 2"   # -T 2: stats a cada 2s
 DPDK_BUILD="$HOME/dpdk/build"
 DR_DIR="$(cd "$(dirname "$0")/.." && pwd)/l2fwd_dr"
 
-# Parâmetros do DualRing (calibrados para 2 lcores, 2 portas)
-# fast_pool=2048: NIC(2×128=256) + caches(2×128=256) + watermark(128) + margem
-FAST_MBUFS=2048
-BURST_MBUFS=65536
-SPILL_WM=1400        # alta: ~1024 disponível em steady → spill ativa sob carga
-RX_RING_DUAL=128     # ring pequeno para o DualRing
-RX_RING_PRIV=1024    # ring grande para o privRing baseline
+# ── Parâmetros DualRing (calibrados para 2 lcores / 2 portas) ────────────────
+RX_RING=128          # anel RX pequeno, residente em LLC (fast path)
+RX_RING_BIG=1024     # anel grande p/ a variante opcional privring_big
+FAST_MBUFS=2048      # fast pool (~4.4 MiB) — cabe na fatia de LLC do CCX
+BURST_MBUFS=65536    # burst pool em DRAM (absorve a rajada)
+RX_BURST_WM=64       # spill quando a fila RX tem ≥ 64 descritores ocupados
+SPILL_WM=256         # guarda de fome de mbufs (secundário)
 
-# Work simulation: réplica do WorkPackage do ShRing (FastClick)
-# work_mem_mb=80: força LLC misses (80 MiB > capacidade DDIO ~8 MiB)
-# work_per_pkt=4:  4 acessos aleatórios por pacote
-WORK_MEM=80
-WORK_PKT=4
+# ── WorkPackage (réplica do ShRing/FastClick) ───────────────────────────────
+# Forçar LLC miss é o que torna o forward CARO e o spill BARATO — condição
+# para o DualRing reduzir perda. APLICADO EM AMBOS privring e dualring.
+WORK_MEM=80          # 80 MiB > capacidade DDIO → LLC miss garantido
+WORK_PKT=4           # 4 acessos aleatórios por pacote
+WORK_ARGS="--work-per-pkt ${WORK_PKT} --work-mem-mb ${WORK_MEM}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -55,52 +68,36 @@ sudo rm -rf /var/run/dpdk/rte/ 2>/dev/null || true
 
 case "${IMPL}" in
 
+  privring)
+    log "privRing (método clássico): anel único ${RX_RING}, sem transbordo, com WorkPackage"
+    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
+      --rx-ring-size ${RX_RING} --fast-mbufs ${FAST_MBUFS} \
+      --disable-burst ${WORK_ARGS}"
+    ;;
+
+  dualring)
+    log "DualRing: anel rápido ${RX_RING} + transbordo DRAM (${BURST_MBUFS}), com WorkPackage"
+    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
+      --rx-ring-size ${RX_RING} --fast-mbufs ${FAST_MBUFS} \
+      --burst-mbufs ${BURST_MBUFS} --rx-burst-watermark ${RX_BURST_WM} \
+      --spill-watermark ${SPILL_WM} ${WORK_ARGS}"
+    ;;
+
+  privring_big)
+    log "privRing anel GRANDE ${RX_RING_BIG} (opcional): absorve rajada, sofre Leaky DMA"
+    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
+      --rx-ring-size ${RX_RING_BIG} --fast-mbufs 8192 \
+      --disable-burst ${WORK_ARGS}"
+    ;;
+
   l2fwd)
-    log "Iniciando l2fwd (privRing padrão DPDK — baseline)"
+    log "l2fwd padrão do DPDK (referência externa, sem WorkPackage)"
     CMD="${DPDK_BUILD}/examples/dpdk-l2fwd ${EAL_ARGS} -- ${APP_ARGS}"
-    ;;
-
-  l2fwd_dr_priv)
-    log "Iniciando l2fwd_dr (privRing grande — ring ${RX_RING_PRIV}, --disable-burst)"
-    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
-      --rx-ring-size ${RX_RING_PRIV} --fast-mbufs 8192 --disable-burst"
-    ;;
-
-  l2fwd_dr_small)
-    log "Iniciando l2fwd_dr (small privRing — ring ${RX_RING_DUAL}, --disable-burst)"
-    log "AVISO: este modo dropa pacotes sob tráfego bursty (comportamento esperado)"
-    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
-      --rx-ring-size ${RX_RING_DUAL} --fast-mbufs ${FAST_MBUFS} --disable-burst"
-    ;;
-
-  l2fwd_dr_dual_nw)
-    log "Iniciando l2fwd_dr (DualRing sem work simulation)"
-    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
-      --rx-ring-size ${RX_RING_DUAL} --fast-mbufs ${FAST_MBUFS} \
-      --burst-mbufs ${BURST_MBUFS} --spill-watermark ${SPILL_WM}"
-    ;;
-
-  l2fwd_dr_dual)
-    log "Iniciando l2fwd_dr (DualRing com work simulation: ${WORK_PKT} acc/pkt em ${WORK_MEM} MiB)"
-    CMD="${DR_DIR}/l2fwd_dr ${EAL_ARGS} -- ${APP_ARGS} \
-      --rx-ring-size ${RX_RING_DUAL} --fast-mbufs ${FAST_MBUFS} \
-      --burst-mbufs ${BURST_MBUFS} --spill-watermark ${SPILL_WM} \
-      --work-per-pkt ${WORK_PKT} --work-mem-mb ${WORK_MEM}"
-    ;;
-
-  shring)
-    SHRING_L2FWD="$HOME/shring-dpdk/build/examples/dpdk-l2fwd"
-    if [[ ! -x "${SHRING_L2FWD}" ]]; then
-        log "ERRO: ShRing não compilado. Rode scripts/setup_shring.sh primeiro."
-        exit 1
-    fi
-    log "Iniciando ShRing (shRing/2: 2 cores compartilham 1 ring)"
-    CMD="${SHRING_L2FWD} ${EAL_ARGS} -- ${APP_ARGS} --shring 2"
     ;;
 
   *)
     echo "Implementação desconhecida: ${IMPL}"
-    echo "Opções: l2fwd | l2fwd_dr_priv | l2fwd_dr_small | l2fwd_dr_dual | l2fwd_dr_dual_nw | shring"
+    echo "Opções: privring | dualring | privring_big | l2fwd"
     exit 1
     ;;
 esac
@@ -109,7 +106,6 @@ log "Comando: ${CMD}"
 log "Duração esperada: ~${DURATION}s (até collect_client.sh terminar)"
 log ""
 
-# Executa a implementação; mata automaticamente após DURATION segundos
 timeout --kill-after=10 "${DURATION}" bash -c "sudo ${CMD}" || true
 
 log "Implementação encerrada."

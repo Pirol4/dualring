@@ -3,20 +3,22 @@
 #
 # Uso: ./collect_client.sh <implementacao> [exp_id]
 #
-#   <implementacao>  Nome da impl sendo medida: l2fwd | dual_ring_fwd | shring
+#   <implementacao>  Nome da impl sendo medida: privring | dualring
+#                    (também aceita privring_big | l2fwd p/ análise complementar)
 #   [exp_id]         ID opcional do experimento (padrão: YYYYMMDD_HHMMSS)
 #                    Use o MESMO exp_id no collect_server.sh para correlacionar.
 #
 # Exemplo:
 #   exp_id=$(date +%Y%m%d_%H%M%S)
-#   # Server: sudo ~/POC_DualRingProject/scripts/collect_server.sh l2fwd $exp_id
-#   # Client: ~/POC_DualRingProject/scripts/collect_client.sh l2fwd $exp_id
+#   # Server: sudo ~/POC_DualRingProject/scripts/collect_server.sh dualring $exp_id
+#   # Client: ~/POC_DualRingProject/scripts/collect_client.sh dualring $exp_id
 #
 # PARÂMETROS FIXOS — não altere entre implementações:
-#   steady_64b : 3% de line rate, 60s por rep
-#   bursty_64b : multiplicador 1 (bursts a 100 Mpps), 60s por rep
-#   Repetições : 5
-#   Intervalo  : 10s entre reps
+#   steady_64b          : 3% de line rate, 60s por rep (sanidade, sem perda)
+#   bursty_64b          : multiplicador 1 (saturação 100%), 60s por rep
+#   bursty_sustain_64b  : multiplicador 1 (rajada sustentável), 60s por rep
+#                         ← é AQUI que o DualRing reduz a perda vs privring
+#   Repetições : 5  ·  Intervalo : 10s entre reps
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -28,6 +30,7 @@ EXP_ID="${2:-$(date +%Y%m%d_%H%M%S)}"
 # Parâmetros fixos
 STEADY_RATE="3%"
 BURSTY_RATE="1"
+SUSTAIN_RATE="1"     # rajada sustentável (regime intermediário) — pps vem do perfil
 DURATION=60
 REPS=5
 INTER_REP_SLEEP=10
@@ -90,8 +93,9 @@ run_profile() {
     echo ""
 }
 
-run_profile "steady_64b"  "${STEADY_RATE}"
-run_profile "bursty_64b"  "${BURSTY_RATE}"
+run_profile "steady_64b"          "${STEADY_RATE}"
+run_profile "bursty_64b"          "${BURSTY_RATE}"
+run_profile "bursty_sustain_64b"  "${SUSTAIN_RATE}"
 
 # ─── Summary CSV ─────────────────────────────────────────────────────────────
 
@@ -116,7 +120,7 @@ def p99_from_hist(hist, total):
             return k
     return max(int(k) for k in hist)
 
-for profile in ["steady_64b", "bursty_64b"]:
+for profile in ["steady_64b", "bursty_64b", "bursty_sustain_64b"]:
     jsonl = os.path.join(outdir, f"{profile}_all.jsonl")
     if not os.path.exists(jsonl):
         continue
