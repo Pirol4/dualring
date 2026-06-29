@@ -32,3 +32,11 @@ run*.txt
 *.swp
 *~
 .DS_Store
+
+# Backups e versões antigas
+*.bak
+
+# Saídas brutas de experimento (commitar só summary.csv + metadata.txt)
+results*/**/*_rep*.txt
+results*/**/*.stderr
+*.stderr
