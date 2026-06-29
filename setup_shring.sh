@@ -36,10 +36,10 @@ git log --oneline -3
 
 # ── 2. Dependências adicionais (mlx5 PMD) ────────────────────────────────────
 log "Verificando dependências mlx5..."
-dpkg -l libibverbs-dev libmlx5-dev ibverbs-providers 2>/dev/null | grep '^ii' | awk '{print $2, $3}' || true
+dpkg -l libibverbs-dev ibverbs-providers 2>/dev/null | grep '^ii' | awk '{print $2, $3}' || true
 
 missing=""
-for pkg in libibverbs-dev libmlx5-dev ibverbs-providers; do
+for pkg in libibverbs-dev ibverbs-providers; do
     dpkg -l "${pkg}" 2>/dev/null | grep -q '^ii' || missing="${missing} ${pkg}"
 done
 if [[ -n "${missing}" ]]; then
