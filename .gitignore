@@ -1,7 +1,7 @@
 # Binários compilados
-mvp1/dual_ring_fwd
 src/server
 src/client
+src/l2fwd_dr
 *.o
 *.a
 *.so
