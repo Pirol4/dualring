@@ -510,9 +510,9 @@ l2fwd_main_loop(void)
              * mbufs no fast_pool. (qc < 0 ⇒ não suportado ⇒ tratado como 0.) */
             int qc = rte_eth_rx_queue_count(portid, 0);
             unsigned qoccup = (qc > 0) ? (unsigned)qc : 0;
+            unsigned fast_avail = rte_mempool_avail_count(fast_pool);
             bool acute = (qoccup >= rx_burst_watermark) ||
-                         (nb_rx == MAX_PKT_BURST) ||
-                         (rte_mempool_avail_count(fast_pool) < spill_watermark);
+                         (fast_avail < spill_watermark);
 
             if (acute) {
                 /* Rescue: drena a NIC barato. Mantém o working set pequeno
