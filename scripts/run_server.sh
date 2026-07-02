@@ -44,7 +44,7 @@ EAL_ARGS="-l 0-1 -n 4 -a ${NIC0} -a ${NIC1}"
 APP_ARGS="-p 0x3 -T 2"   # -T 2: stats a cada 2s
 
 DPDK_BUILD="$HOME/dpdk/build"
-DR_DIR="$(cd "$(dirname "$0")/.." && pwd)/l2fwd_dr"
+DR_DIR="$(cd "$(dirname "$0")/.." && pwd)/src"
 
 # ── Parâmetros DualRing (calibrados para 2 lcores / 2 portas) ────────────────
 RX_RING=128          # anel RX pequeno, residente em LLC (fast path)
